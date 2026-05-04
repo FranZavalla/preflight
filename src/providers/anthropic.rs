@@ -17,6 +17,8 @@ use crate::model::{
 const DEFAULT_MAX_TOKENS: u32 = 1200;
 const THINKING_MAX_TOKENS: u32 = 1600;
 const THINKING_BUDGET_TOKENS: u32 = 1024;
+const ADAPTIVE_THINKING_MAX_TOKENS: u32 = 4096;
+
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
     pub endpoint: String,
@@ -24,6 +26,7 @@ pub struct AnthropicProvider {
     pub model: String,
     pub version: String,
     pub ai_logs: bool,
+    pub reasoning_effort: Option<String>,
 }
 
 fn build_anthropic_payload_variants(
@@ -31,6 +34,7 @@ fn build_anthropic_payload_variants(
     system_prompt: &str,
     messages: &[Value],
     stream: bool,
+    reasoning_effort: Option<&str>,
 ) -> Vec<Value> {
     let normalized_messages = normalize_anthropic_messages(messages);
 
@@ -43,6 +47,20 @@ fn build_anthropic_payload_variants(
 
     if stream {
         base["stream"] = Value::Bool(true);
+    }
+
+    if let Some(effort) = reasoning_effort {
+        let mut with_adaptive = base.clone();
+        with_adaptive["max_tokens"] = Value::from(ADAPTIVE_THINKING_MAX_TOKENS);
+        with_adaptive["thinking"] = json!({
+            "type": "adaptive",
+            "display": "summarized"
+        });
+        with_adaptive["output_config"] = json!({
+            "effort": effort
+        });
+
+        return vec![with_adaptive, base];
     }
 
     let mut with_thinking = base.clone();
@@ -507,6 +525,7 @@ impl AnalysisProvider for AnthropicProvider {
                             system_prompt,
                             messages,
                             true,
+                            self.reasoning_effort.as_deref(),
                         );
 
                         for (attempt_idx, payload) in stream_payloads.iter().enumerate() {
@@ -552,6 +571,7 @@ impl AnalysisProvider for AnthropicProvider {
                         system_prompt,
                         messages,
                         false,
+                        self.reasoning_effort.as_deref(),
                     );
                     let mut last_non_stream_error: Option<String> = None;
 
@@ -590,5 +610,99 @@ impl AnalysisProvider for AnthropicProvider {
                 })
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_messages() -> Vec<Value> {
+        vec![json!({"role": "user", "content": "hello"})]
+    }
+
+    #[test]
+    fn payload_variants_without_reasoning_effort_use_legacy_thinking() {
+        let messages = sample_messages();
+        let variants = build_anthropic_payload_variants(
+            "claude-sonnet-4-6",
+            "system",
+            &messages,
+            false,
+            None,
+        );
+
+        assert_eq!(variants.len(), 2);
+
+        let first = &variants[0];
+        assert_eq!(first["model"], "claude-sonnet-4-6");
+        assert_eq!(first["max_tokens"], THINKING_MAX_TOKENS);
+        assert_eq!(first["thinking"]["type"], "enabled");
+        assert_eq!(first["thinking"]["budget_tokens"], THINKING_BUDGET_TOKENS);
+        assert!(first.get("output_config").is_none());
+
+        let fallback = &variants[1];
+        assert_eq!(fallback["max_tokens"], DEFAULT_MAX_TOKENS);
+        assert!(fallback.get("thinking").is_none());
+        assert!(fallback.get("output_config").is_none());
+    }
+
+    #[test]
+    fn payload_variants_with_reasoning_effort_use_adaptive_thinking() {
+        let messages = sample_messages();
+        let variants = build_anthropic_payload_variants(
+            "claude-opus-4-7",
+            "system",
+            &messages,
+            false,
+            Some("high"),
+        );
+
+        assert_eq!(variants.len(), 2);
+
+        let first = &variants[0];
+        assert_eq!(first["max_tokens"], ADAPTIVE_THINKING_MAX_TOKENS);
+        assert_eq!(first["thinking"]["type"], "adaptive");
+        assert_eq!(first["thinking"]["display"], "summarized");
+        assert_eq!(first["output_config"]["effort"], "high");
+        assert!(first["thinking"].get("budget_tokens").is_none());
+
+        let fallback = &variants[1];
+        assert_eq!(fallback["max_tokens"], DEFAULT_MAX_TOKENS);
+        assert!(fallback.get("thinking").is_none());
+        assert!(fallback.get("output_config").is_none());
+    }
+
+    #[test]
+    fn payload_variants_set_stream_flag_when_requested() {
+        let messages = sample_messages();
+        let variants = build_anthropic_payload_variants(
+            "claude-sonnet-4-6",
+            "system",
+            &messages,
+            true,
+            Some("medium"),
+        );
+
+        for variant in &variants {
+            assert_eq!(variant["stream"], true);
+        }
+    }
+
+    #[test]
+    fn payload_variants_preserve_string_message_content_as_text_block() {
+        let messages = sample_messages();
+        let variants = build_anthropic_payload_variants(
+            "claude-sonnet-4-6",
+            "system",
+            &messages,
+            false,
+            None,
+        );
+
+        let first_message = &variants[0]["messages"][0];
+        assert_eq!(first_message["role"], "user");
+        assert_eq!(first_message["content"][0]["type"], "text");
+        assert_eq!(first_message["content"][0]["text"], "hello");
     }
 }

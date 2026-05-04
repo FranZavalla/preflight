@@ -94,12 +94,19 @@ pub fn build_provider(args: &Args) -> Result<Box<dyn AnalysisProvider>> {
                 .unwrap_or(DEFAULT_ANTHROPIC_API_KEY_ENV);
             let api_key = load_api_key(api_key_env, "anthropic")?;
 
+            let reasoning_effort = args
+                .reasoning_effort
+                .as_deref()
+                .map(validate_anthropic_reasoning_effort)
+                .transpose()?;
+
             Ok(Box::new(AnthropicProvider {
                 endpoint,
                 api_key,
                 model,
                 version: DEFAULT_ANTHROPIC_VERSION.to_string(),
                 ai_logs: args.ai_logs,
+                reasoning_effort,
             }))
         }
         "ollama" => Ok(Box::new(OpenAiProvider {
@@ -120,5 +127,54 @@ pub fn build_provider(args: &Args) -> Result<Box<dyn AnalysisProvider>> {
             "Unsupported provider '{}'. Expected one of: scaffold, heuristic, openai, anthropic, ollama",
             value
         )),
+    }
+}
+
+fn validate_anthropic_reasoning_effort(value: &str) -> Result<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if !matches!(normalized.as_str(), "low" | "medium" | "high" | "max") {
+        return Err(miette::miette!(
+            "Invalid --reasoning-effort '{}' for anthropic provider. Expected one of: low, medium, high, max",
+            value
+        ));
+    }
+    Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_reasoning_effort_accepts_canonical_values() {
+        for value in ["low", "medium", "high", "max"] {
+            let parsed = validate_anthropic_reasoning_effort(value).expect("should accept");
+            assert_eq!(parsed, value);
+        }
+    }
+
+    #[test]
+    fn validate_reasoning_effort_normalizes_case_and_whitespace() {
+        let parsed = validate_anthropic_reasoning_effort("  HIGH  ").expect("should accept");
+        assert_eq!(parsed, "high");
+    }
+
+    #[test]
+    fn validate_reasoning_effort_rejects_unknown_values() {
+        let error = validate_anthropic_reasoning_effort("bogus").expect_err("should fail");
+        assert!(error.to_string().contains("Invalid --reasoning-effort"));
+    }
+
+    #[test]
+    fn validate_reasoning_effort_rejects_openai_only_values() {
+        // 'minimal' is OpenAI-only; Anthropic does not support it.
+        let error = validate_anthropic_reasoning_effort("minimal").expect_err("should fail");
+        assert!(error.to_string().contains("Invalid --reasoning-effort"));
+    }
+
+    #[test]
+    fn validate_reasoning_effort_rejects_empty_string() {
+        let error = validate_anthropic_reasoning_effort("   ").expect_err("should fail");
+        assert!(error.to_string().contains("Invalid --reasoning-effort"));
     }
 }
