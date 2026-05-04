@@ -129,13 +129,6 @@ jobs:
           fi
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
-      - name: Ensure dist is on PATH
-        # The cargo-dist installer drops `dist` into ~/.cargo/bin and updates
-        # .bashrc, but GitHub Actions steps don't source shell profiles. On
-        # runners without Rust pre-installed (e.g. ubuntu-22.04-arm), ~/.cargo/bin
-        # is not on PATH, so the next step would fail with `dist: command not found`.
-        shell: bash
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@v4
