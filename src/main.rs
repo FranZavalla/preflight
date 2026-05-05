@@ -4,7 +4,8 @@ use miette::Result;
 #[derive(Parser)]
 #[command(
     name = "preflight",
-    about = "Aiken smart contract vulnerability auditor"
+    about = "Aiken smart contract vulnerability auditor",
+    version
 )]
 struct Cli {
     #[command(flatten)]
