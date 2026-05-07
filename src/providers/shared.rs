@@ -12,7 +12,7 @@ use crate::model::{
     VulnerabilityFinding, VulnerabilitySkill,
 };
 
-pub(super) const MAX_AGENT_STEPS: usize = 25;
+pub(super) const MAX_AGENT_STEPS: usize = 30;
 const AGENT_SYSTEM_PROMPT: &str =
     include_str!("../../templates/aiken/audit_agent_system_prompt.md");
 const INITIAL_USER_PROMPT_TEMPLATE: &str =
@@ -218,13 +218,41 @@ where
         provider_label,
     } = context;
 
-    for step_idx in 0..MAX_AGENT_STEPS {
+    let mut max_steps = MAX_AGENT_STEPS;
+    let mut step_idx = 0usize;
+
+    loop {
+        if step_idx >= max_steps {
+            if let Some(additional) = prompt_for_additional_agent_steps(
+                provider_label,
+                &skill.id,
+                max_steps,
+            )? {
+                max_steps = max_steps.saturating_add(additional);
+                log_agent_progress(
+                    ai_logs,
+                    format!(
+                        "Continuing skill '{}' with {} additional steps (new max={})",
+                        skill.id, additional, max_steps
+                    ),
+                );
+                continue;
+            }
+
+            return Err(miette::miette!(
+                "{} exceeded max interactive read steps ({}) for skill '{}' (enable --ai-logs to inspect progress)",
+                provider_label,
+                max_steps,
+                skill.id
+            ));
+        }
+
         log_agent_progress(
             ai_logs,
             format!(
                 "Step {}/{} • requesting next action for skill '{}' ({})",
                 step_idx + 1,
-                MAX_AGENT_STEPS,
+                max_steps,
                 skill.id,
                 endpoint
             ),
@@ -235,7 +263,7 @@ where
             format!(
                 "🤔 Thinking… waiting for model response (step {}/{}, skill='{}')",
                 step_idx + 1,
-                MAX_AGENT_STEPS,
+                max_steps,
                 skill.id
             ),
         );
@@ -336,14 +364,50 @@ where
                 }));
             }
         }
+
+        step_idx = step_idx.saturating_add(1);
+    }
+}
+
+fn prompt_for_additional_agent_steps(
+    provider_label: &str,
+    skill_id: &str,
+    max_steps: usize,
+) -> Result<Option<usize>> {
+    eprintln!(
+        "[audit][agent] {} reached the current max steps ({}) for skill '{}'",
+        provider_label, max_steps, skill_id
+    );
+    eprint!("Continue iterating? [y/N]: ");
+    io::stderr().flush().into_diagnostic()?;
+
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer).into_diagnostic()?;
+    let accepted = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    if !accepted {
+        return Ok(None);
     }
 
-    Err(miette::miette!(
-        "{} exceeded max interactive read steps ({}) for skill '{}' (enable --ai-logs to inspect progress)",
-        provider_label,
-        MAX_AGENT_STEPS,
-        skill.id
-    ))
+    eprint!(
+        "How many additional steps? [default {}]: ",
+        MAX_AGENT_STEPS
+    );
+    io::stderr().flush().into_diagnostic()?;
+
+    let mut additional = String::new();
+    io::stdin().read_line(&mut additional).into_diagnostic()?;
+    let additional = additional.trim();
+
+    let parsed = if additional.is_empty() {
+        Some(MAX_AGENT_STEPS)
+    } else {
+        additional.parse::<usize>().ok()
+    };
+
+    match parsed {
+        Some(0) | None => Ok(None),
+        Some(value) => Ok(Some(value)),
+    }
 }
 
 fn render_permission_prompt(permission_prompt: &PermissionPromptSpec) -> String {
