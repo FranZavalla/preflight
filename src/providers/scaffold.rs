@@ -39,6 +39,7 @@ impl AnalysisProvider for ScaffoldProvider {
                     skill.id, prompt.text
                 ),
             }),
+            token_usage: Default::default(),
         })
     }
 }

@@ -10,8 +10,8 @@ use super::shared::{
     stream_content_delta_to_stdout, stream_reasoning_delta_to_stdout,
 };
 use crate::model::{
-    MiniPrompt, PermissionPromptSpec, ProviderSpec, SkillIterationResult, ValidatorContextMap,
-    VulnerabilitySkill,
+    MiniPrompt, PermissionPromptSpec, ProviderSpec, SkillIterationResult, TokenUsage,
+    ValidatorContextMap, VulnerabilitySkill,
 };
 
 const DEFAULT_MAX_TOKENS: u32 = 1200;
@@ -273,6 +273,66 @@ fn extract_anthropic_content_delta(event: &Value) -> Option<String> {
     }
 }
 
+fn extract_anthropic_response_usage(response_json: &Value) -> TokenUsage {
+    let Some(usage) = response_json.get("usage") else {
+        return TokenUsage::default();
+    };
+    read_anthropic_usage_object(usage)
+}
+
+fn update_anthropic_usage_from_event(event: &Value, usage: &mut TokenUsage) {
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    match event_type {
+        "message_start" => {
+            if let Some(usage_obj) = event.pointer("/message/usage") {
+                let parsed = read_anthropic_usage_object(usage_obj);
+                usage.input_tokens = parsed.input_tokens;
+                usage.output_tokens = parsed.output_tokens;
+                if parsed.cache_read_input_tokens.is_some() {
+                    usage.cache_read_input_tokens = parsed.cache_read_input_tokens;
+                }
+                if parsed.cache_creation_input_tokens.is_some() {
+                    usage.cache_creation_input_tokens = parsed.cache_creation_input_tokens;
+                }
+            }
+        }
+        "message_delta" => {
+            // Anthropic sends cumulative output_tokens in message_delta usage. Replace, don't add.
+            if let Some(value) = event
+                .pointer("/usage/output_tokens")
+                .and_then(Value::as_u64)
+            {
+                usage.output_tokens = value;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn read_anthropic_usage_object(usage_obj: &Value) -> TokenUsage {
+    TokenUsage {
+        input_tokens: usage_obj
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        output_tokens: usage_obj
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cache_read_input_tokens: usage_obj
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64),
+        cache_creation_input_tokens: usage_obj
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64),
+        reasoning_tokens: None,
+    }
+}
+
 fn extract_anthropic_non_stream_content(response_json: &Value) -> Option<String> {
     let mut text_chunks = Vec::new();
 
@@ -340,7 +400,7 @@ async fn stream_attempt(
     version: &str,
     payload: &Value,
     ai_logs: bool,
-) -> Result<String> {
+) -> Result<(String, TokenUsage)> {
     let mut response = client
         .post(endpoint)
         .header("x-api-key", api_key)
@@ -364,6 +424,7 @@ async fn stream_attempt(
     let mut model_output = String::new();
     let mut reasoning_stream_state = ReasoningStreamState::default();
     let mut content_stream_state = ContentStreamState::default();
+    let mut usage = TokenUsage::default();
 
     while let Some(chunk) = response.chunk().await.into_diagnostic()? {
         pending.push_str(&String::from_utf8_lossy(&chunk));
@@ -386,6 +447,8 @@ async fn stream_attempt(
                 Ok(parsed) => parsed,
                 Err(_) => continue,
             };
+
+            update_anthropic_usage_from_event(&event, &mut usage);
 
             if let Some(reasoning_delta) = extract_anthropic_reasoning_delta(&event) {
                 maybe_emit_reasoning_line_break_on_summary_change(
@@ -417,7 +480,7 @@ async fn stream_attempt(
         ));
     }
 
-    Ok(model_output)
+    Ok((model_output, usage))
 }
 
 async fn non_stream_attempt(
@@ -427,7 +490,7 @@ async fn non_stream_attempt(
     version: &str,
     payload: &Value,
     ai_logs: bool,
-) -> Result<String> {
+) -> Result<(String, TokenUsage)> {
     let response = client
         .post(endpoint)
         .header("x-api-key", api_key)
@@ -460,7 +523,8 @@ async fn non_stream_attempt(
         );
     }
 
-    Ok(content)
+    let usage = extract_anthropic_response_usage(&response_json);
+    Ok((content, usage))
 }
 
 impl AnalysisProvider for AnthropicProvider {
@@ -687,6 +751,116 @@ mod tests {
         for variant in &variants {
             assert_eq!(variant["stream"], true);
         }
+    }
+
+    #[test]
+    fn extract_response_usage_reads_input_and_output_tokens() {
+        let response = json!({
+            "usage": {
+                "input_tokens": 1234,
+                "output_tokens": 56
+            }
+        });
+        let usage = extract_anthropic_response_usage(&response);
+        assert_eq!(usage.input_tokens, 1234);
+        assert_eq!(usage.output_tokens, 56);
+        assert_eq!(usage.cache_read_input_tokens, None);
+        assert_eq!(usage.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn extract_response_usage_reads_cache_fields_when_present() {
+        let response = json!({
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 100,
+                "cache_creation_input_tokens": 50
+            }
+        });
+        let usage = extract_anthropic_response_usage(&response);
+        assert_eq!(usage.cache_read_input_tokens, Some(100));
+        assert_eq!(usage.cache_creation_input_tokens, Some(50));
+    }
+
+    #[test]
+    fn extract_response_usage_returns_empty_when_missing() {
+        let response = json!({"id": "msg_x"});
+        let usage = extract_anthropic_response_usage(&response);
+        assert!(usage.is_empty());
+    }
+
+    #[test]
+    fn update_usage_from_message_start_event_sets_initial_input_tokens() {
+        let event = json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "usage": {
+                    "input_tokens": 500,
+                    "output_tokens": 1
+                }
+            }
+        });
+        let mut usage = TokenUsage::default();
+        update_anthropic_usage_from_event(&event, &mut usage);
+        assert_eq!(usage.input_tokens, 500);
+        assert_eq!(usage.output_tokens, 1);
+    }
+
+    #[test]
+    fn update_usage_from_message_start_event_captures_cache_fields() {
+        let event = json!({
+            "type": "message_start",
+            "message": {
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 7,
+                    "cache_creation_input_tokens": 3
+                }
+            }
+        });
+        let mut usage = TokenUsage::default();
+        update_anthropic_usage_from_event(&event, &mut usage);
+        assert_eq!(usage.cache_read_input_tokens, Some(7));
+        assert_eq!(usage.cache_creation_input_tokens, Some(3));
+    }
+
+    #[test]
+    fn update_usage_from_message_delta_event_replaces_output_tokens() {
+        let mut usage = TokenUsage {
+            input_tokens: 500,
+            output_tokens: 5,
+            ..Default::default()
+        };
+        let event = json!({
+            "type": "message_delta",
+            "usage": {
+                "output_tokens": 320
+            }
+        });
+        update_anthropic_usage_from_event(&event, &mut usage);
+        // Anthropic sends cumulative output_tokens in message_delta — replace, don't add.
+        assert_eq!(usage.output_tokens, 320);
+        // input_tokens stays as it was.
+        assert_eq!(usage.input_tokens, 500);
+    }
+
+    #[test]
+    fn update_usage_from_unrelated_event_leaves_usage_unchanged() {
+        let mut usage = TokenUsage {
+            input_tokens: 5,
+            output_tokens: 7,
+            ..Default::default()
+        };
+        let event = json!({
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "x"}
+        });
+        update_anthropic_usage_from_event(&event, &mut usage);
+        assert_eq!(usage.input_tokens, 5);
+        assert_eq!(usage.output_tokens, 7);
     }
 
     #[test]

@@ -45,6 +45,7 @@ impl AnalysisProvider for HeuristicProvider {
                     status: "unsupported-skill".to_string(),
                     findings: vec![],
                     next_prompt: None,
+                    token_usage: Default::default(),
                 });
             }
         };
@@ -54,6 +55,7 @@ impl AnalysisProvider for HeuristicProvider {
             status: "completed".to_string(),
             findings,
             next_prompt: None,
+            token_usage: Default::default(),
         })
     }
 }

@@ -10,8 +10,8 @@ use super::shared::{
     stream_content_delta_to_stdout, stream_reasoning_delta_to_stdout,
 };
 use crate::model::{
-    MiniPrompt, PermissionPromptSpec, ProviderSpec, SkillIterationResult, ValidatorContextMap,
-    VulnerabilitySkill,
+    MiniPrompt, PermissionPromptSpec, ProviderSpec, SkillIterationResult, TokenUsage,
+    ValidatorContextMap, VulnerabilitySkill,
 };
 
 #[derive(Debug, Clone)]
@@ -59,6 +59,9 @@ fn build_chat_payload_variants(
 
     if stream {
         base["stream"] = Value::Bool(true);
+        if !ollama_compat {
+            base["stream_options"] = json!({"include_usage": true});
+        }
     }
 
     let mut variants = vec![base.clone()];
@@ -394,13 +397,103 @@ fn extract_responses_reasoning_summary(response_json: &Value) -> Option<String> 
     }
 }
 
+fn extract_openai_chat_usage(response_json: &Value) -> Option<TokenUsage> {
+    let usage = response_json.get("usage")?;
+    if usage.is_null() {
+        return None;
+    }
+
+    let input_tokens = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read_input_tokens = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64);
+    let reasoning_tokens = usage
+        .pointer("/completion_tokens_details/reasoning_tokens")
+        .and_then(Value::as_u64);
+
+    if input_tokens == 0
+        && output_tokens == 0
+        && cache_read_input_tokens.is_none()
+        && reasoning_tokens.is_none()
+    {
+        return None;
+    }
+
+    Some(TokenUsage {
+        input_tokens,
+        output_tokens,
+        cache_read_input_tokens,
+        cache_creation_input_tokens: None,
+        reasoning_tokens,
+    })
+}
+
+fn extract_openai_responses_usage(response_json: &Value) -> Option<TokenUsage> {
+    let usage = response_json.get("usage")?;
+    if usage.is_null() {
+        return None;
+    }
+
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read_input_tokens = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(Value::as_u64);
+    let reasoning_tokens = usage
+        .pointer("/output_tokens_details/reasoning_tokens")
+        .and_then(Value::as_u64);
+
+    if input_tokens == 0
+        && output_tokens == 0
+        && cache_read_input_tokens.is_none()
+        && reasoning_tokens.is_none()
+    {
+        return None;
+    }
+
+    Some(TokenUsage {
+        input_tokens,
+        output_tokens,
+        cache_read_input_tokens,
+        cache_creation_input_tokens: None,
+        reasoning_tokens,
+    })
+}
+
+fn extract_openai_responses_event_usage(event: &Value) -> Option<TokenUsage> {
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    if event_type != "response.completed" && event_type != "response.incomplete" {
+        return None;
+    }
+
+    let response = event.get("response")?;
+    extract_openai_responses_usage(response)
+}
+
 async fn stream_chat_attempt(
     client: &reqwest::Client,
     endpoint: &str,
     api_key: &str,
     payload: &Value,
     ai_logs: bool,
-) -> Result<String> {
+) -> Result<(String, TokenUsage)> {
     let mut response = client
         .post(endpoint)
         .bearer_auth(api_key)
@@ -423,6 +516,7 @@ async fn stream_chat_attempt(
     let mut model_output = String::new();
     let mut reasoning_stream_state = ReasoningStreamState::default();
     let mut content_stream_state = ContentStreamState::default();
+    let mut usage = TokenUsage::default();
 
     while let Some(chunk) = response.chunk().await.into_diagnostic()? {
         pending.push_str(&String::from_utf8_lossy(&chunk));
@@ -445,6 +539,10 @@ async fn stream_chat_attempt(
                 Ok(parsed) => parsed,
                 Err(_) => continue,
             };
+
+            if let Some(chunk_usage) = extract_openai_chat_usage(&event) {
+                usage = chunk_usage;
+            }
 
             if let Some(reasoning_delta) = extract_chat_reasoning_delta(&event) {
                 stream_reasoning_delta_to_stdout(
@@ -471,7 +569,7 @@ async fn stream_chat_attempt(
         ));
     }
 
-    Ok(model_output)
+    Ok((model_output, usage))
 }
 
 async fn stream_responses_attempt(
@@ -480,7 +578,7 @@ async fn stream_responses_attempt(
     api_key: &str,
     payload: &Value,
     ai_logs: bool,
-) -> Result<String> {
+) -> Result<(String, TokenUsage)> {
     let mut response = client
         .post(endpoint)
         .bearer_auth(api_key)
@@ -503,6 +601,7 @@ async fn stream_responses_attempt(
     let mut model_output = String::new();
     let mut reasoning_stream_state = ReasoningStreamState::default();
     let mut content_stream_state = ContentStreamState::default();
+    let mut usage = TokenUsage::default();
 
     while let Some(chunk) = response.chunk().await.into_diagnostic()? {
         pending.push_str(&String::from_utf8_lossy(&chunk));
@@ -525,6 +624,10 @@ async fn stream_responses_attempt(
                 Ok(parsed) => parsed,
                 Err(_) => continue,
             };
+
+            if let Some(event_usage) = extract_openai_responses_event_usage(&event) {
+                usage = event_usage;
+            }
 
             if let Some(reasoning_delta) = extract_responses_reasoning_delta(&event) {
                 maybe_emit_reasoning_line_break_on_summary_change(
@@ -556,7 +659,7 @@ async fn stream_responses_attempt(
         ));
     }
 
-    Ok(model_output)
+    Ok((model_output, usage))
 }
 
 async fn non_stream_chat_attempt(
@@ -565,7 +668,7 @@ async fn non_stream_chat_attempt(
     api_key: &str,
     payload: &Value,
     ai_logs: bool,
-) -> Result<String> {
+) -> Result<(String, TokenUsage)> {
     let response = client
         .post(endpoint)
         .bearer_auth(api_key)
@@ -602,7 +705,8 @@ async fn non_stream_chat_attempt(
         );
     }
 
-    Ok(content.to_string())
+    let usage = extract_openai_chat_usage(&response_json).unwrap_or_default();
+    Ok((content.to_string(), usage))
 }
 
 async fn non_stream_responses_attempt(
@@ -611,7 +715,7 @@ async fn non_stream_responses_attempt(
     api_key: &str,
     payload: &Value,
     ai_logs: bool,
-) -> Result<String> {
+) -> Result<(String, TokenUsage)> {
     let response = client
         .post(endpoint)
         .bearer_auth(api_key)
@@ -633,7 +737,8 @@ async fn non_stream_responses_attempt(
         );
     }
 
-    Ok(content)
+    let usage = extract_openai_responses_usage(&response_json).unwrap_or_default();
+    Ok((content, usage))
 }
 
 impl AnalysisProvider for OpenAiProvider {
@@ -850,5 +955,156 @@ impl AnalysisProvider for OpenAiProvider {
                 })
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::TokenUsage;
+
+    #[test]
+    fn extract_chat_usage_reads_prompt_and_completion_tokens() {
+        let response = json!({
+            "choices": [{"message": {"content": "{}"}}],
+            "usage": {"prompt_tokens": 250, "completion_tokens": 80, "total_tokens": 330}
+        });
+        let usage = extract_openai_chat_usage(&response).expect("usage present");
+        assert_eq!(usage.input_tokens, 250);
+        assert_eq!(usage.output_tokens, 80);
+    }
+
+    #[test]
+    fn extract_chat_usage_returns_none_when_missing() {
+        let response = json!({"choices": []});
+        assert!(extract_openai_chat_usage(&response).is_none());
+    }
+
+    #[test]
+    fn extract_chat_usage_returns_none_when_usage_is_null() {
+        // Streaming chat completions deliver `usage: null` in non-final chunks.
+        let response = json!({"choices": [], "usage": null});
+        assert!(extract_openai_chat_usage(&response).is_none());
+    }
+
+    #[test]
+    fn extract_chat_usage_picks_up_cached_input_tokens() {
+        let response = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "prompt_tokens_details": {"cached_tokens": 40}
+            }
+        });
+        let usage = extract_openai_chat_usage(&response).expect("usage present");
+        assert_eq!(usage.cache_read_input_tokens, Some(40));
+    }
+
+    #[test]
+    fn extract_chat_usage_picks_up_reasoning_tokens() {
+        let response = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 80,
+                "completion_tokens_details": {"reasoning_tokens": 60}
+            }
+        });
+        let usage = extract_openai_chat_usage(&response).expect("usage present");
+        assert_eq!(usage.reasoning_tokens, Some(60));
+    }
+
+    #[test]
+    fn extract_responses_usage_reads_input_and_output_tokens() {
+        let response = json!({
+            "usage": {"input_tokens": 1500, "output_tokens": 90, "total_tokens": 1590}
+        });
+        let usage = extract_openai_responses_usage(&response).expect("usage present");
+        assert_eq!(usage.input_tokens, 1500);
+        assert_eq!(usage.output_tokens, 90);
+    }
+
+    #[test]
+    fn extract_responses_usage_picks_up_cached_and_reasoning() {
+        let response = json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 80,
+                "input_tokens_details": {"cached_tokens": 25},
+                "output_tokens_details": {"reasoning_tokens": 50}
+            }
+        });
+        let usage = extract_openai_responses_usage(&response).expect("usage present");
+        assert_eq!(usage.cache_read_input_tokens, Some(25));
+        assert_eq!(usage.reasoning_tokens, Some(50));
+    }
+
+    #[test]
+    fn extract_responses_usage_returns_none_when_missing() {
+        let response = json!({"id": "resp_x"});
+        assert!(extract_openai_responses_usage(&response).is_none());
+    }
+
+    #[test]
+    fn extract_responses_event_usage_reads_response_completed() {
+        let event = json!({
+            "type": "response.completed",
+            "response": {
+                "usage": {"input_tokens": 200, "output_tokens": 40}
+            }
+        });
+        let usage = extract_openai_responses_event_usage(&event).expect("usage present");
+        assert_eq!(usage.input_tokens, 200);
+        assert_eq!(usage.output_tokens, 40);
+    }
+
+    #[test]
+    fn extract_responses_event_usage_returns_none_for_other_events() {
+        let event = json!({"type": "response.output_text.delta", "delta": "x"});
+        assert!(extract_openai_responses_event_usage(&event).is_none());
+    }
+
+    #[test]
+    fn chat_payload_includes_stream_options_include_usage_when_streaming() {
+        let messages = vec![json!({"role": "user", "content": "hi"})];
+        let variants =
+            build_chat_payload_variants("gpt-4.1-mini", &messages, true, None, false);
+        let payload = &variants[0];
+        assert_eq!(payload["stream"], true);
+        assert_eq!(payload["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn chat_payload_without_stream_does_not_include_stream_options() {
+        let messages = vec![json!({"role": "user", "content": "hi"})];
+        let variants =
+            build_chat_payload_variants("gpt-4.1-mini", &messages, false, None, false);
+        for variant in &variants {
+            assert!(variant.get("stream_options").is_none());
+        }
+    }
+
+    #[test]
+    fn ollama_compat_chat_payload_omits_stream_options() {
+        // Ollama does not support stream_options. Avoid sending it for Ollama-compat clients.
+        let messages = vec![json!({"role": "user", "content": "hi"})];
+        let variants =
+            build_chat_payload_variants("llama3.1", &messages, true, None, true);
+        for variant in &variants {
+            assert!(variant.get("stream_options").is_none());
+        }
+    }
+
+    #[test]
+    fn responses_payload_with_stream_includes_usage_in_response_completed() {
+        // Responses API automatically includes usage in `response.completed`; no flag needed.
+        // Sanity check: stream flag is set when requested.
+        let messages = vec![json!({"role": "user", "content": "hi"})];
+        let variants =
+            build_responses_payload_variants("gpt-4.1-mini", &messages, true, None);
+        assert_eq!(variants[0]["stream"], true);
+    }
+
+    fn _ensure_token_usage_in_scope() -> TokenUsage {
+        TokenUsage::default()
     }
 }

@@ -148,6 +148,7 @@ fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
         ast: Some(ast_context.metadata.clone()),
         validator_context: ast_context.validator_context.clone(),
         iterations: vec![],
+        total_token_usage: Default::default(),
     };
 
     write_state(&state_out, &state)?;
@@ -173,6 +174,12 @@ fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
         state.iterations.len()
     );
     println!("Source files analyzed: {}", state.source_files.len());
+    if !state.total_token_usage.is_empty() {
+        println!(
+            "Token usage (total): {}",
+            format_total_token_usage(&state.total_token_usage)
+        );
+    }
     println!("State written to: {}", state_out.display());
     println!("Report written to: {}", report_out.display());
 
@@ -226,24 +233,48 @@ fn run_skill_loop(
 
         let findings_count = iteration.findings.len();
         let status = iteration.status.clone();
+        let iteration_usage = iteration.token_usage.clone();
 
         append_iteration(state, iteration);
+        state.total_token_usage.add(&iteration_usage);
         write_state(context.state_out, state)?;
 
         log_audit_progress(
             context.ai_logs,
             format!(
-                "Skill {}/{} • completed '{}' • status={} • findings={} • state persisted",
+                "Skill {}/{} • completed '{}' • status={} • findings={} • tokens=({}) • state persisted",
                 skill_idx + 1,
                 total_skills,
                 skill.id,
                 status,
-                findings_count
+                findings_count,
+                format_total_token_usage(&iteration_usage),
             ),
         );
     }
 
     Ok(())
+}
+
+fn format_total_token_usage(usage: &crate::model::TokenUsage) -> String {
+    if usage.is_empty() {
+        return "no token usage reported".to_string();
+    }
+    let mut parts = vec![
+        format!("in: {}", usage.input_tokens),
+        format!("out: {}", usage.output_tokens),
+    ];
+    if let Some(cached) = usage.cache_read_input_tokens
+        && cached > 0
+    {
+        parts.push(format!("cached: {}", cached));
+    }
+    if let Some(reasoning) = usage.reasoning_tokens
+        && reasoning > 0
+    {
+        parts.push(format!("reasoning: {}", reasoning));
+    }
+    parts.join(", ")
 }
 
 fn log_audit_progress(enabled: bool, message: impl AsRef<str>) {

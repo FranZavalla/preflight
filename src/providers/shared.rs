@@ -8,7 +8,7 @@ use std::time::Instant;
 use tokio::runtime::Handle;
 
 use crate::model::{
-    MiniPrompt, PermissionPromptSpec, SkillIterationResult, ValidatorContextMap,
+    MiniPrompt, PermissionPromptSpec, SkillIterationResult, TokenUsage, ValidatorContextMap,
     VulnerabilityFinding, VulnerabilitySkill,
 };
 
@@ -208,7 +208,7 @@ pub(super) fn run_agent_loop<F>(
     mut request_model: F,
 ) -> Result<SkillIterationResult>
 where
-    F: FnMut(&[Value]) -> Result<String>,
+    F: FnMut(&[Value]) -> Result<(String, TokenUsage)>,
 {
     let AgentLoopContext {
         endpoint,
@@ -220,6 +220,7 @@ where
 
     let mut max_steps = MAX_AGENT_STEPS;
     let mut step_idx = 0usize;
+    let mut total_usage = TokenUsage::default();
 
     loop {
         if step_idx >= max_steps {
@@ -269,10 +270,10 @@ where
         );
 
         let request_started_at = Instant::now();
-        let response_content_result = request_model(messages.as_slice());
+        let response_result = request_model(messages.as_slice());
         let elapsed = request_started_at.elapsed();
 
-        if let Err(error) = &response_content_result {
+        if let Err(error) = &response_result {
             log_agent_progress(
                 ai_logs,
                 format!(
@@ -281,14 +282,26 @@ where
                     error
                 ),
             );
+        }
+
+        let (content, step_usage) = response_result?;
+        total_usage.add(&step_usage);
+
+        if !step_usage.is_empty() {
+            log_agent_progress(
+                ai_logs,
+                format!(
+                    "✅ Model response received in {} ms ({})",
+                    elapsed.as_millis(),
+                    format_token_usage_inline(&step_usage)
+                ),
+            );
         } else {
             log_agent_progress(
                 ai_logs,
                 format!("✅ Model response received in {} ms", elapsed.as_millis()),
             );
         }
-
-        let content = response_content_result?;
 
         messages.push(json!({
             "role": "assistant",
@@ -320,16 +333,17 @@ where
                 log_agent_progress(
                     ai_logs,
                     format!(
-                        "Model completed skill '{}' at step {}/{} • status={} • findings={}",
+                        "Model completed skill '{}' at step {}/{} • status={} • findings={} • tokens=({})",
                         skill.id,
                         step_idx + 1,
                         MAX_AGENT_STEPS,
                         status,
-                        findings
+                        findings,
+                        format_token_usage_inline(&total_usage)
                     ),
                 );
 
-                return Ok(iteration_from_parsed(skill, parsed));
+                return Ok(iteration_from_parsed(skill, parsed, total_usage));
             }
             AgentAction::ReadRequest(request) => {
                 log_agent_progress(
@@ -849,6 +863,7 @@ pub(super) fn log_agent_progress(enabled: bool, message: impl AsRef<str>) {
 pub(super) fn iteration_from_parsed(
     skill: &VulnerabilitySkill,
     parsed: Value,
+    token_usage: TokenUsage,
 ) -> SkillIterationResult {
     let findings = parsed
         .get("findings")
@@ -933,7 +948,32 @@ pub(super) fn iteration_from_parsed(
         status,
         findings,
         next_prompt,
+        token_usage,
     }
+}
+
+pub(super) fn format_token_usage_inline(usage: &TokenUsage) -> String {
+    if usage.is_empty() {
+        return "no token usage reported".to_string();
+    }
+
+    let mut parts = vec![
+        format!("in: {}", usage.input_tokens),
+        format!("out: {}", usage.output_tokens),
+    ];
+
+    if let Some(cached) = usage.cache_read_input_tokens
+        && cached > 0
+    {
+        parts.push(format!("cached: {}", cached));
+    }
+    if let Some(reasoning) = usage.reasoning_tokens
+        && reasoning > 0
+    {
+        parts.push(format!("reasoning: {}", reasoning));
+    }
+
+    parts.join(", ")
 }
 
 #[cfg(test)]
