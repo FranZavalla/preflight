@@ -80,10 +80,39 @@ pub fn generate_ast_and_validator_context(
         }
     }
 
-    let parsed_modules = source_files
-        .iter()
-        .map(|source_file| parse_module_snapshot(project_root, source_file))
-        .collect::<Result<Vec<_>>>()?;
+    // A file preflight cannot parse is reported and skipped rather than aborting
+    // the audit: one stray syntax error must not discard every other file.
+    let mut parsed_modules = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+
+    for source_file in source_files {
+        match parse_module_snapshot(project_root, source_file) {
+            Ok(module) => parsed_modules.push(module),
+            Err(error) => {
+                let display = display_path_for_state(project_root, source_file);
+                eprintln!(
+                    "⚠️  Skipping unparseable source file {}: {}",
+                    display, error
+                );
+                skipped.push(display);
+            }
+        }
+    }
+
+    if parsed_modules.is_empty() {
+        return Err(miette::miette!(
+            "No .ak source file could be parsed ({} skipped). Check that the project builds with `aiken check`.",
+            skipped.len()
+        ));
+    }
+
+    if !skipped.is_empty() {
+        eprintln!(
+            "⚠️  {} of {} source file(s) were skipped and are NOT covered by this audit.",
+            skipped.len(),
+            source_files.len()
+        );
+    }
 
     let validator_context = build_validator_context_from_modules(&parsed_modules);
 
@@ -445,7 +474,7 @@ validator alpha {
     }
 
     #[test]
-    fn generate_ast_fails_when_aiken_source_cannot_be_parsed() {
+    fn generate_ast_fails_when_no_aiken_source_can_be_parsed() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path();
         let source = root.join("validators/invalid.ak");
@@ -457,6 +486,41 @@ validator alpha {
         let err = generate_ast_and_validator_context(root, &[source], &ast_out, true)
             .expect_err("expected parser failure");
 
-        assert!(err.to_string().contains("Aiken command failed"));
+        assert!(
+            err.to_string()
+                .contains("No .ak source file could be parsed")
+        );
+    }
+
+    #[test]
+    fn generate_ast_skips_unparseable_files_when_others_parse() {
+        // butane ships a `legacy/` project in pre-1.1 Aiken syntax; one such file
+        // must not discard the parseable files alongside it.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        let valid = root.join("validators/ok.ak");
+        let invalid = root.join("validators/broken.ak");
+        let ast_out = root.join(".tx3/audit/aiken-ast.json");
+
+        fs::create_dir_all(valid.parent().expect("parent")).expect("create parent dir");
+        fs::write(&valid, "validator ok {\n}\n").expect("write valid source file");
+        fs::write(&invalid, "validator broken { spend(").expect("write invalid source file");
+
+        let output = generate_ast_and_validator_context(root, &[valid, invalid], &ast_out, true)
+            .expect("should succeed on the parseable subset");
+
+        assert!(ast_out.is_file(), "snapshot should still be written");
+
+        let snapshot: AstSnapshot =
+            serde_json::from_str(&fs::read_to_string(&ast_out).expect("read snapshot"))
+                .expect("valid snapshot json");
+
+        assert_eq!(
+            snapshot.files.len(),
+            1,
+            "only the parseable file is recorded"
+        );
+        assert!(snapshot.files[0].source_file.ends_with("ok.ak"));
+        assert!(!output.metadata.fingerprint.is_empty());
     }
 }

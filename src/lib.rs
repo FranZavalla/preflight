@@ -88,6 +88,14 @@ pub struct Args {
     /// Fallback main source file path (used when no .ak files are discovered).
     #[arg(long)]
     pub main_source: Option<String>,
+
+    /// Cap outbound model requests per minute for OpenAI-compatible providers.
+    ///
+    /// Gateways enforce a per-account ceiling that no payload change can lift
+    /// (OpenRouter caps new accounts at 10 rpm on some models). Pacing requests
+    /// under the ceiling is cheaper than discovering it with a 429 every time.
+    #[arg(long)]
+    pub max_requests_per_minute: Option<u32>,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -196,6 +204,10 @@ struct SkillLoopContext<'a> {
     state_out: &'a Path,
 }
 
+/// Consecutive skill failures tolerated before the run stops. A blocked account
+/// fails every skill, and retrying 20 of them wastes both time and money.
+const MAX_CONSECUTIVE_SKILL_FAILURES: usize = 3;
+
 fn run_skill_loop(
     skills: &[VulnerabilitySkill],
     state: &mut AnalysisStateJson,
@@ -208,6 +220,7 @@ fn run_skill_loop(
         .collect::<Vec<String>>();
 
     let total_skills = skills.len();
+    let mut consecutive_failures = 0usize;
 
     for (skill_idx, skill) in skills.iter().enumerate() {
         log_audit_progress(
@@ -222,14 +235,58 @@ fn run_skill_loop(
         );
 
         let prompt = build_mini_prompt(skill);
-        let iteration = context.provider.analyze_skill(
+        let iteration = match context.provider.analyze_skill(
             skill,
             &prompt,
             &source_references,
             context.validator_context,
             context.project_root,
             context.permission_prompt,
-        )?;
+        ) {
+            Ok(iteration) => {
+                consecutive_failures = 0;
+                iteration
+            }
+            // One skill failing must not discard every skill after it. Record the
+            // failure in the state file so the gap is visible in the report, then
+            // carry on -- a rate limit that blocks skill 4 has usually cleared by
+            // the time skill 9 comes around.
+            Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+
+                log_audit_progress(
+                    context.ai_logs,
+                    format!(
+                        "Skill {}/{} • FAILED '{}' ({} in a row): {}",
+                        skill_idx + 1,
+                        total_skills,
+                        skill.id,
+                        consecutive_failures,
+                        error
+                    ),
+                );
+
+                if consecutive_failures >= MAX_CONSECUTIVE_SKILL_FAILURES {
+                    return Err(error).wrap_err(format!(
+                        "Stopping: {} skills failed in a row, the remaining {} were not attempted",
+                        consecutive_failures,
+                        total_skills.saturating_sub(skill_idx + 1)
+                    ));
+                }
+
+                let failed = SkillIterationResult {
+                    skill_id: skill.id.clone(),
+                    status: "failed".to_string(),
+                    findings: Vec::new(),
+                    next_prompt: None,
+                    token_usage: crate::model::TokenUsage::default(),
+                };
+
+                append_iteration(state, failed);
+                write_state(context.state_out, state)?;
+                continue;
+            }
+        };
 
         let findings_count = iteration.findings.len();
         let status = iteration.status.clone();
@@ -303,13 +360,17 @@ fn discover_source_files(project_root: &Path) -> Result<Vec<PathBuf>> {
             let path = entry.path();
 
             if path.is_dir() {
-                let skip = path
+                let skip_by_name = path
                     .file_name()
                     .and_then(|name| name.to_str())
                     .map(|name| matches!(name, ".git" | "target" | ".tx3" | "build"))
                     .unwrap_or(false);
 
-                if !skip {
+                // A subdirectory with its own aiken.toml is a separate project
+                // (vendored, legacy, or an example) and is not part of this audit.
+                let is_nested_project = path.join("aiken.toml").is_file();
+
+                if !skip_by_name && !is_nested_project {
                     to_visit.push(path);
                 }
                 continue;
@@ -803,5 +864,188 @@ body
         let markdown = render_findings_markdown(&findings);
 
         assert!(markdown.contains("Location: validators/spend.ak:42"));
+    }
+
+    fn skill_named(id: &str) -> VulnerabilitySkill {
+        VulnerabilitySkill {
+            id: id.to_string(),
+            name: id.to_string(),
+            severity: "low".to_string(),
+            description: String::new(),
+            prompt_fragment: String::new(),
+            examples: Vec::new(),
+            false_positives: Vec::new(),
+            references: Vec::new(),
+            tags: Vec::new(),
+            confidence_hint: None,
+            guidance_markdown: String::new(),
+        }
+    }
+
+    fn permission_spec(root: &Path) -> PermissionPromptSpec {
+        PermissionPromptSpec {
+            shell: "bash".to_string(),
+            allowed_commands: vec![],
+            scope_rules: vec![],
+            workspace_root: root.display().to_string(),
+            read_scope: "workspace".to_string(),
+            interactive_permissions: false,
+            allowed_paths: vec![],
+        }
+    }
+
+    fn empty_state() -> AnalysisStateJson {
+        AnalysisStateJson {
+            version: "1".to_string(),
+            source_files: Vec::new(),
+            provider: crate::model::ProviderSpec {
+                name: "test".to_string(),
+                model: None,
+                notes: String::new(),
+            },
+            permission_prompt: PermissionPromptSpec {
+                shell: "bash".to_string(),
+                allowed_commands: vec![],
+                scope_rules: vec![],
+                workspace_root: String::new(),
+                read_scope: "workspace".to_string(),
+                interactive_permissions: false,
+                allowed_paths: vec![],
+            },
+            ast: None,
+            validator_context: ValidatorContextMap::default(),
+            iterations: Vec::new(),
+            total_token_usage: crate::model::TokenUsage::default(),
+        }
+    }
+
+    #[test]
+    fn skill_loop_records_a_failure_and_continues_to_the_next_skill() {
+        // A rate limit that blocks skill 2 must not discard skills 3 and 4.
+        struct FlakyProvider {
+            calls: std::cell::RefCell<usize>,
+        }
+
+        impl AnalysisProvider for FlakyProvider {
+            fn provider_spec(&self) -> crate::model::ProviderSpec {
+                crate::model::ProviderSpec {
+                    name: "test".to_string(),
+                    model: None,
+                    notes: String::new(),
+                }
+            }
+
+            fn analyze_skill(
+                &self,
+                skill: &VulnerabilitySkill,
+                _prompt: &MiniPrompt,
+                _source_references: &[String],
+                _validator_context: &ValidatorContextMap,
+                _project_root: &Path,
+                _permission_prompt: &PermissionPromptSpec,
+            ) -> Result<SkillIterationResult> {
+                *self.calls.borrow_mut() += 1;
+                if skill.id == "b" {
+                    return Err(miette::miette!("429 Too Many Requests"));
+                }
+                Ok(SkillIterationResult {
+                    skill_id: skill.id.clone(),
+                    status: "completed".to_string(),
+                    findings: Vec::new(),
+                    next_prompt: None,
+                    token_usage: crate::model::TokenUsage::default(),
+                })
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_out = temp.path().join("state.json");
+        let provider = FlakyProvider {
+            calls: std::cell::RefCell::new(0),
+        };
+        let skills: Vec<VulnerabilitySkill> =
+            ["a", "b", "c"].iter().map(|id| skill_named(id)).collect();
+        let mut state = empty_state();
+
+        run_skill_loop(
+            &skills,
+            &mut state,
+            SkillLoopContext {
+                provider: &provider,
+                source_files: &[],
+                validator_context: &ValidatorContextMap::default(),
+                project_root: temp.path(),
+                permission_prompt: &permission_spec(temp.path()),
+                ai_logs: false,
+                state_out: &state_out,
+            },
+        )
+        .expect("one failing skill should not abort the run");
+
+        assert_eq!(
+            *provider.calls.borrow(),
+            3,
+            "every skill should be attempted"
+        );
+        assert_eq!(state.iterations.len(), 3);
+        assert_eq!(state.iterations[0].status, "completed");
+        assert_eq!(state.iterations[1].status, "failed");
+        assert_eq!(state.iterations[2].status, "completed");
+    }
+
+    #[test]
+    fn skill_loop_stops_after_repeated_consecutive_failures() {
+        struct DeadProvider;
+
+        impl AnalysisProvider for DeadProvider {
+            fn provider_spec(&self) -> crate::model::ProviderSpec {
+                crate::model::ProviderSpec {
+                    name: "test".to_string(),
+                    model: None,
+                    notes: String::new(),
+                }
+            }
+
+            fn analyze_skill(
+                &self,
+                _skill: &VulnerabilitySkill,
+                _prompt: &MiniPrompt,
+                _source_references: &[String],
+                _validator_context: &ValidatorContextMap,
+                _project_root: &Path,
+                _permission_prompt: &PermissionPromptSpec,
+            ) -> Result<SkillIterationResult> {
+                Err(miette::miette!("credit balance is too low"))
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_out = temp.path().join("state.json");
+        let skills: Vec<VulnerabilitySkill> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|id| skill_named(id))
+            .collect();
+        let mut state = empty_state();
+
+        let error = run_skill_loop(
+            &skills,
+            &mut state,
+            SkillLoopContext {
+                provider: &DeadProvider,
+                source_files: &[],
+                validator_context: &ValidatorContextMap::default(),
+                project_root: temp.path(),
+                permission_prompt: &permission_spec(temp.path()),
+                ai_logs: false,
+                state_out: &state_out,
+            },
+        )
+        .expect_err("a dead account should stop the run");
+
+        assert!(error.to_string().contains("failed in a row"));
+        assert!(
+            state.iterations.len() < skills.len(),
+            "it must not have attempted every skill"
+        );
     }
 }

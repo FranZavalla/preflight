@@ -12,7 +12,14 @@ use crate::model::{
     VulnerabilityFinding, VulnerabilitySkill,
 };
 
-pub(super) const MAX_AGENT_STEPS: usize = 30;
+pub(super) const MAX_AGENT_STEPS: usize = 90;
+/// Consecutive unparseable replies tolerated before a skill is abandoned.
+const MAX_MALFORMED_REPLIES: usize = 3;
+const MALFORMED_REPLY_NUDGE: &str = "Your last message was not valid JSON. \
+Reply with exactly one JSON object and nothing else - no prose, no code fences, \
+no commentary. Use one of the documented actions (read_file, grep, list_dir, \
+find_files, final).";
+
 const AGENT_SYSTEM_PROMPT: &str =
     include_str!("../../templates/aiken/audit_agent_system_prompt.md");
 const INITIAL_USER_PROMPT_TEMPLATE: &str =
@@ -189,7 +196,7 @@ pub(super) fn build_initial_user_prompt(
 
 pub(super) fn build_tool_result_user_prompt(request: &ReadRequest, output: &str) -> String {
     TOOL_RESULT_PROMPT_TEMPLATE
-        .replace("{{REQUEST}}", &format!("{:?}", request))
+        .replace("{{REQUEST}}", &summarize_read_request(request))
         .replace("{{OUTPUT}}", output)
 }
 
@@ -221,14 +228,13 @@ where
     let mut max_steps = MAX_AGENT_STEPS;
     let mut step_idx = 0usize;
     let mut total_usage = TokenUsage::default();
+    let mut malformed_replies = 0usize;
 
     loop {
         if step_idx >= max_steps {
-            if let Some(additional) = prompt_for_additional_agent_steps(
-                provider_label,
-                &skill.id,
-                max_steps,
-            )? {
+            if let Some(additional) =
+                prompt_for_additional_agent_steps(provider_label, &skill.id, max_steps)?
+            {
                 max_steps = max_steps.saturating_add(additional);
                 log_agent_progress(
                     ai_logs,
@@ -310,7 +316,43 @@ where
 
         log_agent_progress(ai_logs, format!("Model output:\n{}", &content));
 
-        match parse_agent_action(&content)? {
+        let action = match parse_agent_action(&content) {
+            Ok(action) => {
+                malformed_replies = 0;
+                action
+            }
+            // The model has no native tool-calling here, so it can simply emit
+            // prose or garbage. Correct it and retry the step; abandoning 19 other
+            // skills over one bad reply is far worse than spending another step.
+            Err(error) => {
+                malformed_replies = malformed_replies.saturating_add(1);
+
+                if malformed_replies > MAX_MALFORMED_REPLIES {
+                    return Err(error).wrap_err(format!(
+                        "{} returned {} unparseable replies in a row for skill '{}'",
+                        provider_label, malformed_replies, skill.id
+                    ));
+                }
+
+                log_agent_progress(
+                    ai_logs,
+                    format!(
+                        "⚠️ Unparseable reply ({}/{}), asking the model to retry: {}",
+                        malformed_replies, MAX_MALFORMED_REPLIES, error
+                    ),
+                );
+
+                messages.push(json!({
+                    "role": "user",
+                    "content": MALFORMED_REPLY_NUDGE,
+                }));
+
+                step_idx = step_idx.saturating_add(1);
+                continue;
+            }
+        };
+
+        match action {
             AgentAction::Final(parsed) => {
                 let findings = parsed
                     .get("findings")
@@ -402,10 +444,7 @@ fn prompt_for_additional_agent_steps(
         return Ok(None);
     }
 
-    eprint!(
-        "How many additional steps? [default {}]: ",
-        MAX_AGENT_STEPS
-    );
+    eprint!("How many additional steps? [default {}]: ", MAX_AGENT_STEPS);
     io::stderr().flush().into_diagnostic()?;
 
     let mut additional = String::new();
@@ -544,7 +583,12 @@ pub(super) fn execute_read_request(
             let scoped_path = resolve_scoped_path(project_root, path)?;
             enforce_read_scope(request, &scoped_path, project_root, permission_prompt)?;
             confirm_request_if_interactive(request, &scoped_path, project_root, permission_prompt)?;
+            // `-r` so a directory target works at all, and `-E` because the model
+            // writes extended regexes (`a|b|c`), which plain grep reads literally
+            // and silently returns no matches for.
             let args = vec![
+                "-r".to_string(),
+                "-E".to_string(),
                 "-n".to_string(),
                 "-C".to_string(),
                 context_lines.to_string(),
@@ -759,6 +803,46 @@ fn run_command_capture(command: &str, args: &[String], cwd: &Path) -> Result<Str
     Ok(combined)
 }
 
+/// Returns the first balanced JSON object embedded in `content`, ignoring braces
+/// inside string literals. Models without native tool-calling routinely wrap the
+/// object in stray characters or prose, so we recover the payload instead of
+/// failing the whole run.
+fn find_embedded_json_object(content: &str) -> Option<&str> {
+    let bytes = content.as_bytes();
+    let start = content.find('{')?;
+
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, &byte) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&content[start..=offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
 fn parse_structured_content(content: &str) -> Result<Value> {
     if let Ok(parsed) = serde_json::from_str::<Value>(content) {
         return Ok(parsed);
@@ -777,9 +861,33 @@ fn parse_structured_content(content: &str) -> Result<Value> {
         }
     }
 
+    if let Some(embedded) = find_embedded_json_object(trimmed)
+        && let Ok(parsed) = serde_json::from_str::<Value>(embedded)
+    {
+        return Ok(parsed);
+    }
+
     Err(miette::miette!(
-        "AI provider response is not valid JSON for structured findings"
+        "AI provider response is not valid JSON for structured findings. Raw response was: {}",
+        preview_for_error(trimmed)
     ))
+}
+
+/// Keeps the failing payload in the error without flooding the terminal with a
+/// multi-kilobyte response.
+fn preview_for_error(content: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 600;
+
+    if content.is_empty() {
+        return "(empty response)".to_string();
+    }
+
+    let truncated: String = content.chars().take(MAX_PREVIEW_CHARS).collect();
+    if truncated.chars().count() < content.chars().count() {
+        format!("{}… (truncated)", truncated)
+    } else {
+        truncated
+    }
 }
 
 pub(super) fn block_on_runtime_aware<F, T>(future: F) -> Result<T>
@@ -967,6 +1075,13 @@ pub(super) fn format_token_usage_inline(usage: &TokenUsage) -> String {
     {
         parts.push(format!("cached: {}", cached));
     }
+    // Cache writes bill above the standard input rate, so they cannot be folded
+    // into the `cached` figure without understating the cost of a run.
+    if let Some(written) = usage.cache_creation_input_tokens
+        && written > 0
+    {
+        parts.push(format!("cache_write: {}", written));
+    }
     if let Some(reasoning) = usage.reasoning_tokens
         && reasoning > 0
     {
@@ -1109,5 +1224,283 @@ mod tests {
 
         assert!(prompt.contains("Validator context map:"));
         assert!(prompt.contains("- (none)"));
+    }
+
+    #[test]
+    fn parse_structured_content_recovers_object_behind_stray_prefix() {
+        // Observed in the wild: Opus emitted `={"action":...}` and the stray `=`
+        // aborted the whole audit run.
+        let parsed = parse_structured_content(
+            "={\"action\":\"read_file\",\"path\":\"lib/butane/subvalidators/gov_issue.ak\"}",
+        )
+        .expect("should recover embedded object");
+
+        assert_eq!(parsed["action"], "read_file");
+        assert_eq!(parsed["path"], "lib/butane/subvalidators/gov_issue.ak");
+    }
+
+    #[test]
+    fn parse_agent_action_recovers_read_request_behind_stray_prefix() {
+        let action = parse_agent_action("={\"action\":\"read_file\",\"path\":\"lib/a.ak\"}")
+            .expect("should classify as a read request");
+
+        match action {
+            AgentAction::ReadRequest(ReadRequest::ReadFile { path }) => {
+                assert_eq!(path, "lib/a.ak");
+            }
+            other => panic!("expected a read_file request, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_structured_content_ignores_prose_around_the_object() {
+        let parsed = parse_structured_content(
+            "Here is my answer:\n{\"status\":\"completed\",\"findings\":[]}\nHope that helps.",
+        )
+        .expect("should recover embedded object");
+
+        assert_eq!(parsed["status"], "completed");
+        assert_eq!(parsed["findings"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn parse_structured_content_does_not_stop_at_braces_inside_strings() {
+        let parsed = parse_structured_content(
+            "={\"action\":\"grep\",\"pattern\":\"fn foo() { bar }\",\"path\":\"lib\"}",
+        )
+        .expect("should recover embedded object");
+
+        assert_eq!(parsed["pattern"], "fn foo() { bar }");
+        assert_eq!(parsed["path"], "lib");
+    }
+
+    #[test]
+    fn parse_structured_content_handles_escaped_quotes_inside_strings() {
+        let parsed = parse_structured_content(
+            "={\"action\":\"grep\",\"pattern\":\"say \\\"hi\\\" }\",\"path\":\"lib\"}",
+        )
+        .expect("should recover embedded object");
+
+        assert_eq!(parsed["pattern"], "say \"hi\" }");
+    }
+
+    #[test]
+    fn parse_structured_content_still_accepts_plain_and_fenced_json() {
+        let plain = parse_structured_content("{\"action\":\"list_dir\",\"path\":\".\"}")
+            .expect("plain json should parse");
+        assert_eq!(plain["action"], "list_dir");
+
+        let fenced =
+            parse_structured_content("```json\n{\"action\":\"list_dir\",\"path\":\".\"}\n```")
+                .expect("fenced json should parse");
+        assert_eq!(fenced["action"], "list_dir");
+    }
+
+    #[test]
+    fn parse_structured_content_error_includes_the_raw_response() {
+        let error = parse_structured_content("I could not complete this analysis.")
+            .expect_err("should fail without an object");
+
+        assert!(
+            error
+                .to_string()
+                .contains("I could not complete this analysis.")
+        );
+    }
+
+    #[test]
+    fn parse_structured_content_rejects_unbalanced_object() {
+        let error = parse_structured_content("={\"action\":\"read_file\",\"path\":\"a.ak\"")
+            .expect_err("truncated object should not parse");
+
+        assert!(error.to_string().contains("not valid JSON"));
+    }
+
+    #[test]
+    fn tool_result_prompt_uses_readable_request_summary() {
+        let prompt = build_tool_result_user_prompt(
+            &ReadRequest::ReadFile {
+                path: "lib/a.ak".to_string(),
+            },
+            "file contents",
+        );
+
+        assert!(prompt.contains("read_file lib/a.ak"));
+        // Rust `Debug` syntax must not leak into the model prompt.
+        assert!(!prompt.contains("ReadFile {"));
+    }
+
+    #[test]
+    fn grep_searches_directories_recursively() {
+        // Regression: without `-r` grep exits 2 with "Is a directory", which the
+        // model reads as "no matches" and derails on.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        let nested = root.join("lib/butane/subvalidators");
+
+        std::fs::create_dir_all(&nested).expect("create dirs");
+        std::fs::write(
+            nested.join("treasury.ak"),
+            "expect d: types.MonoDatum = raw\n",
+        )
+        .expect("write file");
+
+        let prompt = PermissionPromptSpec {
+            shell: "bash".to_string(),
+            allowed_commands: vec!["grep".to_string()],
+            scope_rules: vec![],
+            workspace_root: root.display().to_string(),
+            read_scope: "workspace".to_string(),
+            interactive_permissions: false,
+            allowed_paths: vec![],
+        };
+
+        let output = execute_read_request(
+            &ReadRequest::Grep {
+                pattern: "MonoDatum".to_string(),
+                path: "lib/butane".to_string(),
+                context_lines: 1,
+            },
+            &root.canonicalize().expect("canonical root"),
+            &prompt,
+        )
+        .expect("directory grep should work");
+
+        assert!(output.contains("MonoDatum"), "got: {}", output);
+        assert!(
+            !output.contains("Is a directory") && !output.contains("Es un directorio"),
+            "got: {}",
+            output
+        );
+    }
+
+    #[test]
+    fn grep_supports_extended_regex_alternation() {
+        // Regression: plain grep reads `a|b` as a literal and silently matches
+        // nothing, which wasted whole agent steps.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        let dir = root.join("lib");
+
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(dir.join("utils.ak"), "fn stake_cred_from_hash() {}\n").expect("write");
+
+        let prompt = PermissionPromptSpec {
+            shell: "bash".to_string(),
+            allowed_commands: vec!["grep".to_string()],
+            scope_rules: vec![],
+            workspace_root: root.display().to_string(),
+            read_scope: "workspace".to_string(),
+            interactive_permissions: false,
+            allowed_paths: vec![],
+        };
+
+        let output = execute_read_request(
+            &ReadRequest::Grep {
+                pattern: "nonexistent_helper|stake_cred_from_hash".to_string(),
+                path: "lib".to_string(),
+                context_lines: 0,
+            },
+            &root.canonicalize().expect("canonical root"),
+            &prompt,
+        )
+        .expect("alternation grep should work");
+
+        assert!(output.contains("stake_cred_from_hash"), "got: {}", output);
+    }
+
+    fn dummy_skill() -> VulnerabilitySkill {
+        VulnerabilitySkill {
+            id: "test-skill".to_string(),
+            name: "test".to_string(),
+            severity: "low".to_string(),
+            description: String::new(),
+            prompt_fragment: String::new(),
+            examples: Vec::new(),
+            false_positives: Vec::new(),
+            references: Vec::new(),
+            tags: Vec::new(),
+            confidence_hint: None,
+            guidance_markdown: String::new(),
+        }
+    }
+
+    fn loop_context<'a>(root: &'a Path, prompt: &'a PermissionPromptSpec) -> AgentLoopContext<'a> {
+        AgentLoopContext {
+            endpoint: "test://endpoint",
+            ai_logs: false,
+            project_root: root,
+            permission_prompt: prompt,
+            provider_label: "Test provider",
+        }
+    }
+
+    #[test]
+    fn agent_loop_recovers_from_one_malformed_reply() {
+        // Reproduces the Sonnet 5 run that emitted "Tool disabled\nconsole.log('a')"
+        // and took all 20 skills down with it.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let prompt = PermissionPromptSpec {
+            shell: "bash".to_string(),
+            allowed_commands: vec![],
+            scope_rules: vec![],
+            workspace_root: root.display().to_string(),
+            read_scope: "workspace".to_string(),
+            interactive_permissions: false,
+            allowed_paths: vec![],
+        };
+
+        let replies = [
+            "\nTool disabled\nconsole.log('a')".to_string(),
+            r#"{"status":"completed","findings":[]}"#.to_string(),
+        ];
+        let mut sent = 0usize;
+        let skill = dummy_skill();
+        let mut messages = Vec::new();
+
+        let result = run_agent_loop(&skill, loop_context(&root, &prompt), &mut messages, |_| {
+            let reply = replies[sent].clone();
+            sent += 1;
+            Ok((reply, TokenUsage::default()))
+        })
+        .expect("loop should recover and finish");
+
+        assert_eq!(sent, 2, "the bad reply should have been retried");
+        assert_eq!(result.findings.len(), 0);
+        assert!(
+            messages.iter().any(|m| m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("not valid JSON"))),
+            "a corrective nudge should have been sent"
+        );
+    }
+
+    #[test]
+    fn agent_loop_gives_up_after_repeated_malformed_replies() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let prompt = PermissionPromptSpec {
+            shell: "bash".to_string(),
+            allowed_commands: vec![],
+            scope_rules: vec![],
+            workspace_root: root.display().to_string(),
+            read_scope: "workspace".to_string(),
+            interactive_permissions: false,
+            allowed_paths: vec![],
+        };
+
+        let mut sent = 0usize;
+        let skill = dummy_skill();
+        let mut messages = Vec::new();
+
+        let error = run_agent_loop(&skill, loop_context(&root, &prompt), &mut messages, |_| {
+            sent += 1;
+            Ok(("still not json".to_string(), TokenUsage::default()))
+        })
+        .expect_err("persistent garbage should fail the skill");
+
+        assert_eq!(sent, MAX_MALFORMED_REPLIES + 1, "should stop after the cap");
+        assert!(error.to_string().contains("unparseable replies in a row"));
     }
 }
