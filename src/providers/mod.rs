@@ -51,6 +51,14 @@ fn load_api_key(api_key_env: &str, provider_name: &str) -> Result<String> {
     })
 }
 
+/// Turns a requests-per-minute ceiling into the minimum spacing between
+/// requests. `None` (or 0) leaves requests unpaced.
+fn min_request_interval(args: &Args) -> Option<std::time::Duration> {
+    args.max_requests_per_minute
+        .filter(|rpm| *rpm > 0)
+        .map(|rpm| std::time::Duration::from_secs_f64(60.0 / f64::from(rpm)))
+}
+
 pub fn build_provider(args: &Args) -> Result<Box<dyn AnalysisProvider>> {
     match args.provider.to_ascii_lowercase().as_str() {
         "scaffold" => Ok(Box::new(ScaffoldProvider)),
@@ -77,6 +85,7 @@ pub fn build_provider(args: &Args) -> Result<Box<dyn AnalysisProvider>> {
                 ai_logs: args.ai_logs,
                 reasoning_effort: args.reasoning_effort.clone(),
                 ollama_compat: false,
+                min_request_interval: min_request_interval(args),
             }))
         }
         "anthropic" => {
@@ -122,6 +131,7 @@ pub fn build_provider(args: &Args) -> Result<Box<dyn AnalysisProvider>> {
             ai_logs: args.ai_logs,
             reasoning_effort: args.reasoning_effort.clone(),
             ollama_compat: true,
+            min_request_interval: min_request_interval(args),
         })),
         value => Err(miette::miette!(
             "Unsupported provider '{}'. Expected one of: scaffold, heuristic, openai, anthropic, ollama",
