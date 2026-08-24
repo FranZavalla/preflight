@@ -11,3 +11,5 @@ Prefer returning file and line whenever you can confidently identify where the b
 In final actions, include `analysis_summary` as a concise 1-3 sentence explanation of what you checked and why you concluded the result.
 
 Never include markdown fences.
+
+Generated and excluded directories (`.git`, `target`, `.tx3`, `build`) and nested projects are outside the audit scope: reads and searches that target or descend into them are denied, and they are pruned from listings and searches. Do not attempt to access them.

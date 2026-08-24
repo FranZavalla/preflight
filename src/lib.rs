@@ -12,6 +12,7 @@ use self::model::{
     AnalysisStateJson, MiniPrompt, PermissionPromptSpec, SkillIterationResult, ValidatorContextMap,
     VulnerabilityFinding, VulnerabilityReportSpec, VulnerabilitySkill,
 };
+use self::providers::shared::is_ignored_path;
 use self::providers::{AnalysisProvider, build_provider};
 
 const DEFAULT_SKILLS_DIR: &str = "skills/vulnerabilities";
@@ -360,17 +361,10 @@ fn discover_source_files(project_root: &Path) -> Result<Vec<PathBuf>> {
             let path = entry.path();
 
             if path.is_dir() {
-                let skip_by_name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map(|name| matches!(name, ".git" | "target" | ".tx3" | "build"))
-                    .unwrap_or(false);
-
-                // A subdirectory with its own aiken.toml is a separate project
-                // (vendored, legacy, or an example) and is not part of this audit.
-                let is_nested_project = path.join("aiken.toml").is_file();
-
-                if !skip_by_name && !is_nested_project {
+                // A `.git`/`target`/`.tx3`/`build` directory, or a subdirectory
+                // with its own aiken.toml (vendored, legacy, or an example), is a
+                // separate concern and is not part of this audit.
+                if !is_ignored_path(project_root, &path) {
                     to_visit.push(path);
                 }
                 continue;
@@ -474,7 +468,7 @@ fn build_permission_prompt_spec(
         );
     } else {
         scope_rules.push(
-            "Read scope is workspace: any path under project root can be read/searched."
+            "Read scope is workspace: any path under project root can be read/searched, except generated/excluded directories (.git, target, .tx3, build) and nested projects, which are never accessible."
                 .to_string(),
         );
     }

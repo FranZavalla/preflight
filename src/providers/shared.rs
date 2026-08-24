@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::Instant;
 use tokio::runtime::Handle;
 
@@ -19,6 +20,40 @@ const MALFORMED_REPLY_NUDGE: &str = "Your last message was not valid JSON. \
 Reply with exactly one JSON object and nothing else - no prose, no code fences, \
 no commentary. Use one of the documented actions (read_file, grep, list_dir, \
 find_files, final).";
+
+/// Directory names that are always outside the audit scope. This mirrors the
+/// skip list in `discover_source_files` (`crate::lib`) so that AI tool reads
+/// cannot reach what source discovery excluded.
+pub(crate) const EXCLUDED_DIR_NAMES: &[&str] = &[".git", "target", ".tx3", "build"];
+
+/// Returns `true` when `canonical_path` lies inside a directory that source
+/// discovery excludes: a `.git`/`target`/`.tx3`/`build` directory anywhere
+/// along the path, or a nested project (a non-root directory containing its own
+/// `aiken.toml`).
+///
+/// `canonical_path` must already be canonicalized and under `project_root`.
+pub(crate) fn is_ignored_path(project_root: &Path, canonical_path: &Path) -> bool {
+    let relative = match canonical_path.strip_prefix(project_root) {
+        Ok(relative) => relative,
+        Err(_) => return false,
+    };
+
+    let mut ancestor = project_root.to_path_buf();
+    for component in relative.components() {
+        let name = component.as_os_str();
+        if EXCLUDED_DIR_NAMES
+            .iter()
+            .any(|excluded| name == std::ffi::OsStr::new(excluded))
+        {
+            return true;
+        }
+        ancestor.push(component);
+        if ancestor != project_root && ancestor.join("aiken.toml").is_file() {
+            return true;
+        }
+    }
+    false
+}
 
 const AGENT_SYSTEM_PROMPT: &str =
     include_str!("../../templates/aiken/audit_agent_system_prompt.md");
@@ -583,20 +618,45 @@ pub(super) fn execute_read_request(
             let scoped_path = resolve_scoped_path(project_root, path)?;
             enforce_read_scope(request, &scoped_path, project_root, permission_prompt)?;
             confirm_request_if_interactive(request, &scoped_path, project_root, permission_prompt)?;
-            // `-r` so a directory target works at all, and `-E` because the model
-            // writes extended regexes (`a|b|c`), which plain grep reads literally
-            // and silently returns no matches for.
-            let args = vec![
-                "-r".to_string(),
+
+            // `-E` because the model writes extended regexes (`a|b|c`), which plain
+            // grep reads literally and silently returns no matches for.
+            let mut base_args = vec![
                 "-E".to_string(),
                 "-n".to_string(),
                 "-C".to_string(),
                 context_lines.to_string(),
-                "--".to_string(),
-                pattern.clone(),
-                scoped_path.to_string_lossy().to_string(),
             ];
 
+            if scoped_path.is_dir() {
+                if gnu_grep_available() {
+                    // GNU grep prunes excluded dirs natively.
+                    base_args.push("-r".to_string());
+                    for excluded in EXCLUDED_DIR_NAMES {
+                        base_args.push(format!("--exclude-dir={}", excluded));
+                    }
+                } else {
+                    // BSD grep (macOS) has no `--exclude-dir`; pre-walk in Rust
+                    // and grep the allowed files explicitly so excluded dirs
+                    // never leak through a recursive search.
+                    let allowed = collect_allowed_files(project_root, &scoped_path)?;
+                    if allowed.is_empty() {
+                        return Ok("(no in-scope files to search)".to_string());
+                    }
+                    let mut args = base_args;
+                    args.push("--".to_string());
+                    args.push(pattern.clone());
+                    for file in allowed {
+                        args.push(file.to_string_lossy().to_string());
+                    }
+                    return run_command_capture("grep", &args, project_root);
+                }
+            }
+
+            let mut args = base_args;
+            args.push("--".to_string());
+            args.push(pattern.clone());
+            args.push(scoped_path.to_string_lossy().to_string());
             run_command_capture("grep", &args, project_root)
         }
         ReadRequest::ListDir { path } => {
@@ -605,28 +665,42 @@ pub(super) fn execute_read_request(
             enforce_read_scope(request, &scoped_path, project_root, permission_prompt)?;
             confirm_request_if_interactive(request, &scoped_path, project_root, permission_prompt)?;
             let args = vec!["-la".to_string(), scoped_path.to_string_lossy().to_string()];
-            run_command_capture("ls", &args, project_root)
+            let raw = run_command_capture("ls", &args, project_root)?;
+            // Drop entries that are excluded directories (or nested projects),
+            // so a root-level listing never reveals them.
+            let mut kept = Vec::new();
+            for line in raw.lines() {
+                if let Some(name) = line.split_whitespace().next_back() {
+                    let name = name.trim();
+                    let ignored = EXCLUDED_DIR_NAMES.contains(&name)
+                        || is_ignored_path(project_root, &scoped_path.join(name));
+                    if ignored {
+                        continue;
+                    }
+                }
+                kept.push(line);
+            }
+            Ok(kept.join("\n"))
         }
         ReadRequest::FindFiles { path, glob } => {
             ensure_allowed(permission_prompt, "find")?;
             let scoped_path = resolve_scoped_path(project_root, path)?;
             enforce_read_scope(request, &scoped_path, project_root, permission_prompt)?;
             confirm_request_if_interactive(request, &scoped_path, project_root, permission_prompt)?;
-            let scoped = scoped_path.to_string_lossy().to_string();
-
-            let args = if let Some(glob) = glob {
-                vec![
-                    scoped,
-                    "-type".to_string(),
-                    "f".to_string(),
-                    "-name".to_string(),
-                    glob.clone(),
-                ]
+            let allowed = collect_allowed_files(project_root, &scoped_path)?;
+            let filtered: Vec<String> = allowed
+                .iter()
+                .filter(|file| match glob {
+                    Some(glob) => glob_match(glob, &file_name_of(file)),
+                    None => true,
+                })
+                .map(|file| file.to_string_lossy().to_string())
+                .collect();
+            Ok(if filtered.is_empty() {
+                "(no matching files found)".to_string()
             } else {
-                vec![scoped, "-type".to_string(), "f".to_string()]
-            };
-
-            run_command_capture("find", &args, project_root)
+                filtered.join("\n")
+            })
         }
     }
 }
@@ -637,6 +711,17 @@ fn enforce_read_scope(
     project_root: &Path,
     permission_prompt: &PermissionPromptSpec,
 ) -> Result<()> {
+    // Excluded directories are outside the audit scope under every read scope,
+    // so this gate applies before the strict/workspace branch.
+    if is_ignored_path(project_root, scoped_path) {
+        return Err(miette::miette!(
+            "Request denied: '{}' is inside an excluded directory ({}); \
+             these directories are outside the audit scope",
+            display_relative_path(project_root, scoped_path),
+            EXCLUDED_DIR_NAMES.join(", ")
+        ));
+    }
+
     if !permission_prompt.read_scope.eq_ignore_ascii_case("strict") {
         return Ok(());
     }
@@ -760,6 +845,99 @@ fn resolve_scoped_path(project_root: &Path, requested_path: &str) -> Result<Path
     }
 
     Ok(canonical)
+}
+
+/// Whether the `grep` on PATH is GNU (which supports `--exclude-dir`). Cached,
+/// since the subprocess probe only needs to run once per process.
+fn gnu_grep_available() -> bool {
+    static GNU_GREP: OnceLock<bool> = OnceLock::new();
+    *GNU_GREP.get_or_init(|| {
+        Command::new("grep")
+            .arg("--version")
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|text| text.contains("GNU grep"))
+            .unwrap_or(false)
+    })
+}
+
+/// Recursively collects files under `target` (or `target` itself when it is a
+/// file), pruning excluded directories and nested projects so they never reach
+/// a recursive grep or file listing.
+fn collect_allowed_files(project_root: &Path, target: &Path) -> Result<Vec<PathBuf>> {
+    if target.is_file() {
+        return Ok(vec![target.to_path_buf()]);
+    }
+
+    let mut files = Vec::new();
+    let mut to_visit = vec![target.to_path_buf()];
+
+    while let Some(dir) = to_visit.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .into_diagnostic()
+            .with_context(|| format!("Failed to read directory {}", dir.display()))?;
+
+        for entry in entries {
+            let entry = entry.into_diagnostic()?;
+            let path = entry.path();
+            if path.is_dir() {
+                if !is_ignored_path(project_root, &path) {
+                    to_visit.push(path);
+                }
+            } else {
+                files.push(path);
+            }
+        }
+    }
+
+    files.sort();
+    Ok(files)
+}
+
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+/// Minimal shell-style glob supporting `*` and `?`, matching against the whole
+/// name. Enough for the model's `find_files` globs (`*.ak`, `*test*.compact`).
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    let (mut p, mut n) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+
+    while n < name.len() {
+        match pattern.get(p) {
+            Some('*') => {
+                star = Some((p, n));
+                p += 1;
+            }
+            Some('?') => {
+                p += 1;
+                n += 1;
+            }
+            Some(c) if *c == name[n] => {
+                p += 1;
+                n += 1;
+            }
+            _ => match star {
+                Some((sp, sn)) => {
+                    p = sp + 1;
+                    n = sn + 1;
+                    star = Some((sp, n));
+                }
+                None => return false,
+            },
+        }
+    }
+
+    while pattern.get(p) == Some(&'*') {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 fn run_command_capture(command: &str, args: &[String], cwd: &Path) -> Result<String> {
@@ -1502,5 +1680,181 @@ mod tests {
 
         assert_eq!(sent, MAX_MALFORMED_REPLIES + 1, "should stop after the cap");
         assert!(error.to_string().contains("unparseable replies in a row"));
+    }
+
+    fn workspace_prompt(root: &Path, commands: Vec<&str>) -> PermissionPromptSpec {
+        PermissionPromptSpec {
+            shell: "bash".to_string(),
+            allowed_commands: commands.into_iter().map(ToString::to_string).collect(),
+            scope_rules: vec![],
+            workspace_root: root.display().to_string(),
+            read_scope: "workspace".to_string(),
+            interactive_permissions: false,
+            allowed_paths: vec![],
+        }
+    }
+
+    fn seed_project(root: &Path) {
+        std::fs::create_dir_all(root.join("validators")).expect("create validators");
+        std::fs::write(root.join("validators/spend.ak"), "validator spend {}\n")
+            .expect("write source");
+        for dir in ["build", "target", ".git", ".tx3"] {
+            std::fs::create_dir_all(root.join(dir)).expect("create excluded dir");
+        }
+        std::fs::write(root.join("build/secret.ak"), "validator secret {}\n")
+            .expect("write secret in build");
+        std::fs::write(root.join(".git/config"), "[core]\n").expect("write git config");
+    }
+
+    #[test]
+    fn is_ignored_path_detects_excluded_and_nested_project_paths() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("build")).expect("create build");
+        std::fs::create_dir_all(root.join("lib/vendored")).expect("create vendored");
+        std::fs::create_dir_all(root.join("validators")).expect("create validators");
+        std::fs::write(root.join("lib/vendored/aiken.toml"), "").expect("write aiken.toml");
+        std::fs::write(root.join("validators/x.ak"), "").expect("write normal file");
+        std::fs::write(root.join("build/secret.ak"), "").expect("write secret");
+
+        let canonical = |p: &Path| p.canonicalize().expect("canonicalize");
+
+        assert!(is_ignored_path(
+            root,
+            &canonical(&root.join("build/secret.ak"))
+        ));
+        assert!(is_ignored_path(root, &canonical(&root.join("build"))));
+        assert!(is_ignored_path(
+            root,
+            &canonical(&root.join("lib/vendored/aiken.toml"))
+        ));
+        assert!(is_ignored_path(
+            root,
+            &canonical(&root.join("lib/vendored"))
+        ));
+        assert!(!is_ignored_path(
+            root,
+            &canonical(&root.join("validators/x.ak"))
+        ));
+        assert!(!is_ignored_path(root, &canonical(&root.join("validators"))));
+        assert!(!is_ignored_path(root, root));
+    }
+
+    #[test]
+    fn read_file_inside_excluded_dir_is_denied_even_in_workspace_scope() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        seed_project(root);
+        let prompt = workspace_prompt(&root, vec!["cat"]);
+
+        let err = execute_read_request(
+            &ReadRequest::ReadFile {
+                path: "build/secret.ak".to_string(),
+            },
+            &root.canonicalize().expect("canonical root"),
+            &prompt,
+        )
+        .expect_err("read inside excluded dir must be denied");
+
+        assert!(err.to_string().contains("excluded directory"));
+    }
+
+    #[test]
+    fn read_file_in_normal_dir_is_allowed_in_workspace_scope() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        seed_project(root);
+        let prompt = workspace_prompt(root, vec!["cat"]);
+
+        let output = execute_read_request(
+            &ReadRequest::ReadFile {
+                path: "validators/spend.ak".to_string(),
+            },
+            &root.canonicalize().expect("canonical root"),
+            &prompt,
+        )
+        .expect("normal read should be allowed");
+
+        assert!(output.contains("validator spend"));
+    }
+
+    #[test]
+    fn find_files_on_root_excludes_build_git_target_tx3() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        seed_project(root);
+        std::fs::write(root.join("validators/extra.ak"), "").expect("write extra");
+        let prompt = workspace_prompt(root, vec!["find"]);
+
+        let output = execute_read_request(
+            &ReadRequest::FindFiles {
+                path: ".".to_string(),
+                glob: Some("*.ak".to_string()),
+            },
+            &root.canonicalize().expect("canonical root"),
+            &prompt,
+        )
+        .expect("find should succeed");
+
+        assert!(output.contains("spend.ak"), "got: {output}");
+        assert!(output.contains("extra.ak"), "got: {output}");
+        assert!(
+            !output.contains("secret.ak"),
+            "excluded dir file must not leak: {output}"
+        );
+    }
+
+    #[test]
+    fn list_dir_on_root_omits_excluded_dirs() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        seed_project(root);
+        let prompt = workspace_prompt(root, vec!["ls"]);
+
+        let output = execute_read_request(
+            &ReadRequest::ListDir {
+                path: ".".to_string(),
+            },
+            &root.canonicalize().expect("canonical root"),
+            &prompt,
+        )
+        .expect("list_dir should succeed");
+
+        for excluded in [".git", "target", ".tx3", "build"] {
+            assert!(
+                !output.lines().any(|line| line.ends_with(excluded)),
+                "{output}"
+            );
+        }
+        assert!(
+            output.lines().any(|line| line.ends_with("validators")),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn grep_on_root_prunes_excluded_dirs() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        seed_project(root);
+        std::fs::write(root.join("validators/extra.ak"), "validator extra {}\n").expect("write");
+        let prompt = workspace_prompt(root, vec!["grep"]);
+
+        let output = execute_read_request(
+            &ReadRequest::Grep {
+                pattern: "validator".to_string(),
+                path: ".".to_string(),
+                context_lines: 0,
+            },
+            &root.canonicalize().expect("canonical root"),
+            &prompt,
+        )
+        .expect("grep should succeed");
+
+        assert!(output.contains("spend.ak"), "got: {output}");
+        assert!(
+            !output.contains("secret.ak"),
+            "grep must not descend into excluded dirs: {output}"
+        );
     }
 }

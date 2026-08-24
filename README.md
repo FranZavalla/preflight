@@ -6,7 +6,7 @@
 
 ## How it works
 
-1. **Source discovery** — recursively scans the working directory for `.ak` files (skipping `target/`, `build/`, `.git/`, `.tx3/`).
+1. **Source discovery** — recursively scans the working directory for `.ak` files (skipping `target/`, `build/`, `.git/`, `.tx3/`, and nested projects with their own `aiken.toml`).
 2. **AST generation** — parses each source file with `aiken-lang`, builds a per-validator context (handlers, parameters, source spans), and caches the snapshot to `.tx3/audit/aiken-ast.json`.
 3. **Skill loop** — for each vulnerability skill (markdown files with YAML frontmatter), invokes the configured provider with the skill prompt and AST context. The provider returns findings (or asks for additional file reads via a tool-call loop).
 4. **Persistence** — after every skill iteration, the analysis state is written to `.tx3/audit/state.json` so partial progress survives interruptions.
@@ -117,7 +117,7 @@ preflight --provider ollama --model llama3.1
 
 When the AI provider asks to read additional files, requests are gated:
 
-- `--read-scope workspace` (default) — any path under the project root may be read.
+- `--read-scope workspace` (default) — any path under the project root may be read. Excluded directories (`.git/`, `target/`, `.tx3/`, `build/`, and nested projects) are always pruned and unreachable, for every scope.
 - `--read-scope strict` — only the source files discovered up front are readable.
 - `--interactive-permissions` — prompt the user before each AI-requested read.
 
