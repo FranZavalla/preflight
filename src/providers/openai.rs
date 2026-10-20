@@ -1,6 +1,7 @@
 use miette::{Context, IntoDiagnostic, Result};
 use serde_json::{Value, json};
 use std::path::Path;
+use std::time::Duration;
 
 use super::AnalysisProvider;
 use super::shared::{
@@ -40,6 +41,212 @@ fn detect_api_family(endpoint: &str, ollama_compat: bool) -> ApiFamily {
     } else {
         ApiFamily::ChatCompletions
     }
+}
+
+/// Total attempts per payload variant, including the initial one.
+const MAX_RATE_LIMIT_ATTEMPTS: usize = 3;
+const RATE_LIMIT_BASE_DELAY: Duration = Duration::from_secs(5);
+const RATE_LIMIT_MAX_DELAY: Duration = Duration::from_secs(60);
+const RATE_LIMIT_TOTAL_WAIT_BUDGET: Duration = Duration::from_secs(120);
+
+/// What a caller should do next after a failed attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    /// Nothing can succeed: exhausted credits, bad key, unroutable model.
+    Fatal,
+    /// The payload is fine; the account is sending too fast. Wait, resend the
+    /// *same* payload — switching variants here would only thrash the cache.
+    RateLimited,
+    /// This payload shape was rejected; the next variant may work.
+    NextVariant,
+}
+
+#[derive(Debug)]
+struct AttemptFailure {
+    report: miette::Report,
+    kind: FailureKind,
+    retry_after: Option<Duration>,
+}
+
+impl AttemptFailure {
+    fn is_fatal(&self) -> bool {
+        self.kind == FailureKind::Fatal
+    }
+}
+
+impl From<miette::Report> for AttemptFailure {
+    fn from(report: miette::Report) -> Self {
+        Self {
+            report,
+            kind: FailureKind::NextVariant,
+            retry_after: None,
+        }
+    }
+}
+
+/// Pulls `error.message` out of an OpenAI-shaped error body, falling back to the
+/// raw body when it is not the shape we expect.
+fn api_error_message(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .as_ref()
+        .and_then(|parsed| parsed.pointer("/error/message"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| body.trim().to_string())
+}
+
+/// Reads how long to wait before resending.
+///
+/// `retry-after` is seconds. OpenRouter sends `x-ratelimit-reset` instead, as
+/// the epoch instant the window reopens — in milliseconds, though seconds and
+/// plain relative values show up across gateways, so all three are accepted.
+fn parse_retry_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    if let Some(seconds) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        return Some(Duration::from_secs(seconds).min(RATE_LIMIT_MAX_DELAY));
+    }
+
+    let reset = headers
+        .get("x-ratelimit-reset")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())?;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+
+    let millis = if reset > 1_000_000_000_000 {
+        reset.saturating_sub(now_ms)
+    } else if reset > 1_000_000_000 {
+        reset.saturating_mul(1_000).saturating_sub(now_ms)
+    } else {
+        reset.saturating_mul(1_000)
+    };
+
+    (millis > 0).then(|| Duration::from_millis(millis).min(RATE_LIMIT_MAX_DELAY))
+}
+
+fn classify_request_failure(
+    label: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+    retry_after: Option<Duration>,
+) -> AttemptFailure {
+    // 402 is how a gateway reports an empty balance; 401/403 are key and routing
+    // problems. No payload variant and no amount of waiting fixes any of them.
+    if matches!(status.as_u16(), 401..=403) {
+        return AttemptFailure {
+            report: miette::miette!(
+                "AI provider rejected the request ({}): {}",
+                status,
+                api_error_message(body)
+            ),
+            kind: FailureKind::Fatal,
+            retry_after: None,
+        };
+    }
+
+    // 429 and 5xx are timing problems, not payload problems.
+    if status.as_u16() == 429 || status.is_server_error() {
+        return AttemptFailure {
+            report: miette::miette!(
+                "AI provider is throttling or unavailable ({}): {}",
+                status,
+                api_error_message(body)
+            ),
+            kind: FailureKind::RateLimited,
+            retry_after,
+        };
+    }
+
+    AttemptFailure {
+        report: miette::miette!("{} failed with status {}: {}", label, status, body),
+        kind: FailureKind::NextVariant,
+        retry_after: None,
+    }
+}
+
+/// Returns the delay to use before the next attempt, or `None` when the failure
+/// is not retryable or the total wait budget would be exceeded.
+fn retry_delay_after_failure(
+    failure: &AttemptFailure,
+    retry: usize,
+    waited: Duration,
+) -> Option<Duration> {
+    if failure.kind != FailureKind::RateLimited {
+        return None;
+    }
+
+    let delay = failure
+        .retry_after
+        .unwrap_or_else(|| RATE_LIMIT_BASE_DELAY * 2u32.pow(retry.min(31) as u32))
+        .min(RATE_LIMIT_MAX_DELAY);
+
+    (waited.saturating_add(delay) <= RATE_LIMIT_TOTAL_WAIT_BUDGET).then_some(delay)
+}
+
+/// Runs one payload variant, waiting out rate limits instead of falling through
+/// to a different variant or failing the skill.
+async fn attempt_with_backoff<'a, F, Fut>(
+    ai_logs: bool,
+    label: &str,
+    attempt_idx: usize,
+    mut run: F,
+) -> std::result::Result<(String, TokenUsage), AttemptFailure>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<(String, TokenUsage), AttemptFailure>>
+        + 'a,
+{
+    let mut waited = Duration::ZERO;
+    let mut last = match run().await {
+        Ok(value) => return Ok(value),
+        Err(failure) => failure,
+    };
+
+    for retry in 0..MAX_RATE_LIMIT_ATTEMPTS.saturating_sub(1) {
+        // Time matters: stop retrying once the total wait would exceed the
+        // budget instead of sleeping for minutes on a saturated account.
+        let Some(delay) = retry_delay_after_failure(&last, retry, waited) else {
+            log_agent_progress(
+                ai_logs,
+                format!(
+                    "⏳ {} attempt {} stopped retrying (budget {}s exhausted); giving up",
+                    label,
+                    attempt_idx + 1,
+                    RATE_LIMIT_TOTAL_WAIT_BUDGET.as_secs()
+                ),
+            );
+            return Err(last);
+        };
+
+        waited = waited.saturating_add(delay);
+
+        log_agent_progress(
+            ai_logs,
+            format!(
+                "⏳ {} attempt {} rate limited; waiting {}s before retry {}/{}",
+                label,
+                attempt_idx + 1,
+                delay.as_secs(),
+                retry + 1,
+                MAX_RATE_LIMIT_ATTEMPTS.saturating_sub(1)
+            ),
+        );
+        tokio::time::sleep(delay).await;
+
+        last = match run().await {
+            Ok(value) => return Ok(value),
+            Err(failure) => failure,
+        };
+    }
+
+    Err(last)
 }
 
 fn build_chat_payload_variants(
@@ -493,7 +700,7 @@ async fn stream_chat_attempt(
     api_key: &str,
     payload: &Value,
     ai_logs: bool,
-) -> Result<(String, TokenUsage)> {
+) -> std::result::Result<(String, TokenUsage), AttemptFailure> {
     let mut response = client
         .post(endpoint)
         .bearer_auth(api_key)
@@ -504,11 +711,13 @@ async fn stream_chat_attempt(
 
     let status = response.status();
     if !status.is_success() {
+        let retry_after = parse_retry_delay(response.headers());
         let body = response.text().await.into_diagnostic()?;
-        return Err(miette::miette!(
-            "Streaming request failed with status {}: {}",
+        return Err(classify_request_failure(
+            "Streaming request",
             status,
-            body
+            &body,
+            retry_after,
         ));
     }
 
@@ -564,9 +773,7 @@ async fn stream_chat_attempt(
     finalize_reasoning_stdout(ai_logs, &mut reasoning_stream_state);
 
     if model_output.is_empty() {
-        return Err(miette::miette!(
-            "Streaming response did not include content deltas"
-        ));
+        return Err(miette::miette!("Streaming response did not include content deltas").into());
     }
 
     Ok((model_output, usage))
@@ -578,7 +785,7 @@ async fn stream_responses_attempt(
     api_key: &str,
     payload: &Value,
     ai_logs: bool,
-) -> Result<(String, TokenUsage)> {
+) -> std::result::Result<(String, TokenUsage), AttemptFailure> {
     let mut response = client
         .post(endpoint)
         .bearer_auth(api_key)
@@ -589,11 +796,13 @@ async fn stream_responses_attempt(
 
     let status = response.status();
     if !status.is_success() {
+        let retry_after = parse_retry_delay(response.headers());
         let body = response.text().await.into_diagnostic()?;
-        return Err(miette::miette!(
-            "Streaming request failed with status {}: {}",
+        return Err(classify_request_failure(
+            "Streaming request",
             status,
-            body
+            &body,
+            retry_after,
         ));
     }
 
@@ -654,9 +863,9 @@ async fn stream_responses_attempt(
     finalize_reasoning_stdout(ai_logs, &mut reasoning_stream_state);
 
     if model_output.is_empty() {
-        return Err(miette::miette!(
-            "Streaming response did not include output text deltas"
-        ));
+        return Err(
+            miette::miette!("Streaming response did not include output text deltas").into(),
+        );
     }
 
     Ok((model_output, usage))
@@ -668,7 +877,7 @@ async fn non_stream_chat_attempt(
     api_key: &str,
     payload: &Value,
     ai_logs: bool,
-) -> Result<(String, TokenUsage)> {
+) -> std::result::Result<(String, TokenUsage), AttemptFailure> {
     let response = client
         .post(endpoint)
         .bearer_auth(api_key)
@@ -677,7 +886,20 @@ async fn non_stream_chat_attempt(
         .await
         .into_diagnostic()?;
 
-    let response = response.error_for_status().into_diagnostic()?;
+    // `error_for_status` throws the body away, and the body is where the gateway
+    // explains *why* it refused — which decides whether waiting can help.
+    let status = response.status();
+    if !status.is_success() {
+        let retry_after = parse_retry_delay(response.headers());
+        let body = response.text().await.into_diagnostic()?;
+        return Err(classify_request_failure(
+            "Non-stream request",
+            status,
+            &body,
+            retry_after,
+        ));
+    }
+
     let response_json = response.json::<Value>().await.into_diagnostic()?;
 
     let content = response_json
@@ -715,7 +937,7 @@ async fn non_stream_responses_attempt(
     api_key: &str,
     payload: &Value,
     ai_logs: bool,
-) -> Result<(String, TokenUsage)> {
+) -> std::result::Result<(String, TokenUsage), AttemptFailure> {
     let response = client
         .post(endpoint)
         .bearer_auth(api_key)
@@ -724,7 +946,20 @@ async fn non_stream_responses_attempt(
         .await
         .into_diagnostic()?;
 
-    let response = response.error_for_status().into_diagnostic()?;
+    // `error_for_status` throws the body away, and the body is where the gateway
+    // explains *why* it refused — which decides whether waiting can help.
+    let status = response.status();
+    if !status.is_success() {
+        let retry_after = parse_retry_delay(response.headers());
+        let body = response.text().await.into_diagnostic()?;
+        return Err(classify_request_failure(
+            "Non-stream request",
+            status,
+            &body,
+            retry_after,
+        ));
+    }
+
     let response_json = response.json::<Value>().await.into_diagnostic()?;
 
     let content = extract_responses_output_text(&response_json)
@@ -840,39 +1075,47 @@ impl AnalysisProvider for OpenAiProvider {
                         };
 
                         for (attempt_idx, stream_payload) in stream_payloads.iter().enumerate() {
-                            let stream_attempt = match api_family {
-                                ApiFamily::ChatCompletions => {
-                                    stream_chat_attempt(
-                                        &client,
-                                        &self.endpoint,
-                                        &self.api_key,
-                                        stream_payload,
-                                        self.ai_logs,
-                                    )
-                                    .await
-                                }
-                                ApiFamily::Responses => {
-                                    stream_responses_attempt(
-                                        &client,
-                                        &self.endpoint,
-                                        &self.api_key,
-                                        stream_payload,
-                                        self.ai_logs,
-                                    )
-                                    .await
-                                }
-                            };
-
-                            match stream_attempt {
+                            match attempt_with_backoff(
+                                self.ai_logs,
+                                "Streaming",
+                                attempt_idx,
+                                || async {
+                                    match api_family {
+                                        ApiFamily::ChatCompletions => {
+                                            stream_chat_attempt(
+                                                &client,
+                                                &self.endpoint,
+                                                &self.api_key,
+                                                stream_payload,
+                                                self.ai_logs,
+                                            )
+                                            .await
+                                        }
+                                        ApiFamily::Responses => {
+                                            stream_responses_attempt(
+                                                &client,
+                                                &self.endpoint,
+                                                &self.api_key,
+                                                stream_payload,
+                                                self.ai_logs,
+                                            )
+                                            .await
+                                        }
+                                    }
+                                },
+                            )
+                            .await
+                            {
                                 Ok(content) => return Ok(content),
-                                Err(error) => {
-                                    last_stream_error = Some(error.to_string());
+                                Err(failure) if failure.is_fatal() => return Err(failure.report),
+                                Err(failure) => {
+                                    last_stream_error = Some(failure.report.to_string());
                                     log_agent_progress(
                                         self.ai_logs,
                                         format!(
                                             "⚠️ Streaming attempt {} failed: {}",
                                             attempt_idx + 1,
-                                            error
+                                            failure.report
                                         ),
                                     );
                                 }
@@ -909,39 +1152,47 @@ impl AnalysisProvider for OpenAiProvider {
                     let mut last_non_stream_error: Option<String> = None;
 
                     for (attempt_idx, payload) in non_stream_payloads.iter().enumerate() {
-                        let request_result = match api_family {
-                            ApiFamily::ChatCompletions => {
-                                non_stream_chat_attempt(
-                                    &client,
-                                    &self.endpoint,
-                                    &self.api_key,
-                                    payload,
-                                    self.ai_logs,
-                                )
-                                .await
-                            }
-                            ApiFamily::Responses => {
-                                non_stream_responses_attempt(
-                                    &client,
-                                    &self.endpoint,
-                                    &self.api_key,
-                                    payload,
-                                    self.ai_logs,
-                                )
-                                .await
-                            }
-                        };
-
-                        match request_result {
+                        match attempt_with_backoff(
+                            self.ai_logs,
+                            "Non-stream",
+                            attempt_idx,
+                            || async {
+                                match api_family {
+                                    ApiFamily::ChatCompletions => {
+                                        non_stream_chat_attempt(
+                                            &client,
+                                            &self.endpoint,
+                                            &self.api_key,
+                                            payload,
+                                            self.ai_logs,
+                                        )
+                                        .await
+                                    }
+                                    ApiFamily::Responses => {
+                                        non_stream_responses_attempt(
+                                            &client,
+                                            &self.endpoint,
+                                            &self.api_key,
+                                            payload,
+                                            self.ai_logs,
+                                        )
+                                        .await
+                                    }
+                                }
+                            },
+                        )
+                        .await
+                        {
                             Ok(content) => return Ok(content),
-                            Err(error) => {
-                                last_non_stream_error = Some(error.to_string());
+                            Err(failure) if failure.is_fatal() => return Err(failure.report),
+                            Err(failure) => {
+                                last_non_stream_error = Some(failure.report.to_string());
                                 log_agent_progress(
                                     self.ai_logs,
                                     format!(
                                         "⚠️ Non-stream attempt {} failed: {}",
                                         attempt_idx + 1,
-                                        error
+                                        failure.report
                                     ),
                                 );
                             }
@@ -962,6 +1213,159 @@ impl AnalysisProvider for OpenAiProvider {
 mod tests {
     use super::*;
     use crate::model::TokenUsage;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn headers_with(name: &'static str, value: String) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(name, value.parse().expect("valid header value"));
+        headers
+    }
+
+    #[test]
+    fn retry_after_header_is_read_in_seconds() {
+        let headers = headers_with("retry-after", "12".to_string());
+        assert_eq!(parse_retry_delay(&headers), Some(Duration::from_secs(12)));
+    }
+
+    #[test]
+    fn ratelimit_reset_is_read_as_epoch_milliseconds() {
+        // What OpenRouter actually sends: the instant the window reopens.
+        let reset_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis() as u64
+            + 30_000;
+
+        let delay = parse_retry_delay(&headers_with("x-ratelimit-reset", reset_ms.to_string()))
+            .expect("a delay");
+
+        // Allow slack for the clock read between building and parsing.
+        assert!(
+            delay <= Duration::from_secs(30) && delay >= Duration::from_secs(25),
+            "unexpected delay: {:?}",
+            delay
+        );
+    }
+
+    #[test]
+    fn a_reset_already_in_the_past_yields_no_delay() {
+        let elapsed_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis() as u64
+            - 5_000;
+
+        assert_eq!(
+            parse_retry_delay(&headers_with("x-ratelimit-reset", elapsed_ms.to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn throttling_is_classified_as_rate_limited() {
+        let failure = classify_request_failure(
+            "Streaming request",
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"Rate limit exceeded: new-account-rpm"}}"#,
+            Some(Duration::from_secs(9)),
+        );
+
+        assert_eq!(failure.kind, FailureKind::RateLimited);
+        assert_eq!(failure.retry_after, Some(Duration::from_secs(9)));
+        assert!(!failure.is_fatal());
+        assert!(failure.report.to_string().contains("new-account-rpm"));
+    }
+
+    #[test]
+    fn an_empty_balance_is_fatal() {
+        let failure = classify_request_failure(
+            "Non-stream request",
+            reqwest::StatusCode::PAYMENT_REQUIRED,
+            r#"{"error":{"message":"Insufficient credits"}}"#,
+            None,
+        );
+
+        assert!(failure.is_fatal());
+        assert!(failure.report.to_string().contains("Insufficient credits"));
+    }
+
+    #[test]
+    fn a_rejected_payload_shape_falls_through_to_the_next_variant() {
+        let failure = classify_request_failure(
+            "Non-stream request",
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"Unsupported parameter: reasoning"}}"#,
+            None,
+        );
+
+        assert_eq!(failure.kind, FailureKind::NextVariant);
+    }
+
+    #[tokio::test]
+    async fn retries_a_rate_limited_request_without_switching_variants() {
+        let attempts = AtomicUsize::new(0);
+
+        let result = attempt_with_backoff(false, "Test", 0, || {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                if attempt < 3 {
+                    Err(AttemptFailure {
+                        report: miette::miette!("429 Too Many Requests"),
+                        kind: FailureKind::RateLimited,
+                        retry_after: Some(Duration::ZERO),
+                    })
+                } else {
+                    Ok(("done".to_string(), TokenUsage::default()))
+                }
+            }
+        })
+        .await
+        .expect("should recover after retries");
+
+        assert_eq!(result.0, "done");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn fatal_failures_are_not_retried() {
+        let attempts = AtomicUsize::new(0);
+
+        let error = attempt_with_backoff(false, "Test", 0, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err(AttemptFailure {
+                    report: miette::miette!("credit balance is too low"),
+                    kind: FailureKind::Fatal,
+                    retry_after: None,
+                })
+            }
+        })
+        .await
+        .expect_err("fatal failures should stop immediately");
+
+        assert!(error.report.to_string().contains("credit balance"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn retry_budget_rejects_a_wait_that_exceeds_it() {
+        let failure = AttemptFailure {
+            report: miette::miette!("429 Too Many Requests"),
+            kind: FailureKind::RateLimited,
+            retry_after: Some(Duration::from_secs(121)),
+        };
+
+        // The per-attempt delay is capped at 60s...
+        assert_eq!(
+            retry_delay_after_failure(&failure, 0, Duration::ZERO),
+            Some(Duration::from_secs(60))
+        );
+        // ...and a second wait would exceed the 120s total budget.
+        assert_eq!(
+            retry_delay_after_failure(&failure, 1, Duration::from_secs(61)),
+            None
+        );
+    }
 
     #[test]
     fn extract_chat_usage_reads_prompt_and_completion_tokens() {
@@ -1066,8 +1470,7 @@ mod tests {
     #[test]
     fn chat_payload_includes_stream_options_include_usage_when_streaming() {
         let messages = vec![json!({"role": "user", "content": "hi"})];
-        let variants =
-            build_chat_payload_variants("gpt-4.1-mini", &messages, true, None, false);
+        let variants = build_chat_payload_variants("gpt-4.1-mini", &messages, true, None, false);
         let payload = &variants[0];
         assert_eq!(payload["stream"], true);
         assert_eq!(payload["stream_options"]["include_usage"], true);
@@ -1076,8 +1479,7 @@ mod tests {
     #[test]
     fn chat_payload_without_stream_does_not_include_stream_options() {
         let messages = vec![json!({"role": "user", "content": "hi"})];
-        let variants =
-            build_chat_payload_variants("gpt-4.1-mini", &messages, false, None, false);
+        let variants = build_chat_payload_variants("gpt-4.1-mini", &messages, false, None, false);
         for variant in &variants {
             assert!(variant.get("stream_options").is_none());
         }
@@ -1087,8 +1489,7 @@ mod tests {
     fn ollama_compat_chat_payload_omits_stream_options() {
         // Ollama does not support stream_options. Avoid sending it for Ollama-compat clients.
         let messages = vec![json!({"role": "user", "content": "hi"})];
-        let variants =
-            build_chat_payload_variants("llama3.1", &messages, true, None, true);
+        let variants = build_chat_payload_variants("llama3.1", &messages, true, None, true);
         for variant in &variants {
             assert!(variant.get("stream_options").is_none());
         }
@@ -1099,8 +1500,7 @@ mod tests {
         // Responses API automatically includes usage in `response.completed`; no flag needed.
         // Sanity check: stream flag is set when requested.
         let messages = vec![json!({"role": "user", "content": "hi"})];
-        let variants =
-            build_responses_payload_variants("gpt-4.1-mini", &messages, true, None);
+        let variants = build_responses_payload_variants("gpt-4.1-mini", &messages, true, None);
         assert_eq!(variants[0]["stream"], true);
     }
 
