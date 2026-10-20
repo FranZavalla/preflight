@@ -231,7 +231,7 @@ pub(super) fn build_initial_user_prompt(
 
 pub(super) fn build_tool_result_user_prompt(request: &ReadRequest, output: &str) -> String {
     TOOL_RESULT_PROMPT_TEMPLATE
-        .replace("{{REQUEST}}", &format!("{:?}", request))
+        .replace("{{REQUEST}}", &summarize_read_request(request))
         .replace("{{OUTPUT}}", output)
 }
 
@@ -1660,6 +1660,20 @@ mod tests {
             .expect_err("truncated object should not parse");
 
         assert!(error.to_string().contains("not valid JSON"));
+    }
+
+    #[test]
+    fn tool_result_prompt_uses_readable_request_summary() {
+        let prompt = build_tool_result_user_prompt(
+            &ReadRequest::ReadFile {
+                path: "lib/a.ak".to_string(),
+            },
+            "file contents",
+        );
+
+        assert!(prompt.contains("read_file lib/a.ak"));
+        // Rust `Debug` syntax must not leak into the model prompt.
+        assert!(!prompt.contains("ReadFile {"));
     }
 
     fn dummy_skill() -> VulnerabilitySkill {
