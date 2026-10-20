@@ -494,8 +494,7 @@ validator alpha {
 
     #[test]
     fn generate_ast_skips_unparseable_files_when_others_parse() {
-        // butane ships a `legacy/` project in pre-1.1 Aiken syntax; one such file
-        // must not discard the parseable files alongside it.
+        // one  file must not discard the parseable files alongside it.
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path();
         let valid = root.join("validators/ok.ak");
