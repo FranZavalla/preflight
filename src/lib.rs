@@ -19,6 +19,17 @@ use self::providers::{AnalysisProvider, build_provider};
 
 const DEFAULT_SKILLS_DIR: &str = "skills/vulnerabilities";
 
+/// Bumped when audit behavior changes without a binary version bump.
+const AUDIT_CONTEXT_VERSION: &str = "1";
+/// Bumped when heuristic detector behavior changes.
+const HEURISTIC_DETECTOR_VERSION: &str = "1";
+const AGENT_SYSTEM_PROMPT_TEMPLATE: &str =
+    include_str!("../templates/aiken/audit_agent_system_prompt.md");
+const INITIAL_USER_PROMPT_TEMPLATE: &str =
+    include_str!("../templates/aiken/audit_agent_initial_user_prompt.md");
+const TOOL_RESULT_PROMPT_TEMPLATE: &str =
+    include_str!("../templates/aiken/audit_agent_tool_result_prompt.md");
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ReadScopeArg {
     Workspace,
@@ -332,14 +343,6 @@ fn run_skill_loop(
                     ),
                 );
 
-                if consecutive_failures >= MAX_CONSECUTIVE_SKILL_FAILURES {
-                    return Err(error).wrap_err(format!(
-                        "Stopping: {} skills failed in a row, the remaining {} were not attempted",
-                        consecutive_failures,
-                        total_skills.saturating_sub(skill_idx + 1)
-                    ));
-                }
-
                 let failed = SkillIterationResult {
                     skill_id: skill.id.clone(),
                     status: "failed".to_string(),
@@ -351,75 +354,19 @@ fn run_skill_loop(
                     token_usage: crate::model::TokenUsage::default(),
                 };
 
+                // Record the failure before aborting: the third consecutive
+                // failure is still an attempted skill and must appear in state.
                 upsert_iteration(state, failed);
                 update_total_duration(state);
                 write_state(context.state_out, state)?;
-            }
-        }
-    }
 
-    // One retry pass for transient failures. Rate limits and endpoint hiccups
-    // often clear while the remaining skills run; a blocked account fails this
-    // pass too, but it costs only one request per failed skill.
-    let failed_skill_ids = state
-        .iterations
-        .iter()
-        .filter(|iteration| iteration.status == "failed")
-        .map(|iteration| iteration.skill_id.clone())
-        .collect::<Vec<String>>();
-
-    for skill in skills
-        .iter()
-        .filter(|skill| failed_skill_ids.iter().any(|id| id == &skill.id))
-    {
-        let prompt = build_mini_prompt(skill);
-        let fingerprint = prompt_fingerprint(&prompt);
-
-        log_audit_progress(
-            context.ai_logs,
-            format!("Retrying failed skill '{}' once", skill.id),
-        );
-
-        let started = Instant::now();
-        match run_skill_once(skill, &prompt, &fingerprint, &context, &source_references) {
-            Ok(mut iteration) => {
-                // Keep the time spent on the failed attempt: the retry replaces
-                // the iteration, but both attempts belong to the same run.
-                let previous_duration = state
-                    .iterations
-                    .iter()
-                    .find(|iteration| iteration.skill_id == skill.id)
-                    .and_then(|iteration| iteration.duration_ms)
-                    .unwrap_or(0);
-                iteration.duration_ms =
-                    Some(previous_duration + started.elapsed().as_millis() as u64);
-                let usage = iteration.token_usage.clone();
-                let status = iteration.status.clone();
-                let findings_count = iteration.findings.len();
-                upsert_iteration(state, iteration);
-                state.total_token_usage.add(&usage);
-                update_total_duration(state);
-                write_state(context.state_out, state)?;
-
-                log_audit_progress(
-                    context.ai_logs,
-                    format!(
-                        "Retry succeeded for '{}' • status={} • findings={} • tokens=({})",
-                        skill.id,
-                        status,
-                        findings_count,
-                        format_total_token_usage(&usage)
-                    ),
-                );
-            }
-            Err(error) => {
-                log_audit_progress(
-                    context.ai_logs,
-                    format!(
-                        "Retry failed for '{}'; keeping the recorded failure: {}",
-                        skill.id, error
-                    ),
-                );
+                if consecutive_failures >= MAX_CONSECUTIVE_SKILL_FAILURES {
+                    return Err(error).wrap_err(format!(
+                        "Stopping: {} skills failed in a row, the remaining {} were not attempted",
+                        consecutive_failures,
+                        total_skills.saturating_sub(skill_idx + 1)
+                    ));
+                }
             }
         }
     }
@@ -518,8 +465,11 @@ fn iteration_is_reusable(status: &str, provider_name: &str) -> bool {
 }
 
 fn provider_matches(previous: Option<&ProviderSpec>, current: &ProviderSpec) -> bool {
-    previous
-        .is_some_and(|previous| previous.name == current.name && previous.model == current.model)
+    previous.is_some_and(|previous| {
+        previous.name == current.name
+            && previous.model == current.model
+            && previous.notes == current.notes
+    })
 }
 
 fn sort_iterations_by_skill_order(state: &mut AnalysisStateJson, skills: &[VulnerabilitySkill]) {
@@ -531,8 +481,27 @@ fn sort_iterations_by_skill_order(state: &mut AnalysisStateJson, skills: &[Vulne
     });
 }
 
+fn audit_context_fingerprint() -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        AUDIT_CONTEXT_VERSION,
+        HEURISTIC_DETECTOR_VERSION,
+        env!("CARGO_PKG_VERSION"),
+        AGENT_SYSTEM_PROMPT_TEMPLATE,
+        INITIAL_USER_PROMPT_TEMPLATE,
+        TOOL_RESULT_PROMPT_TEMPLATE
+    )
+}
+
 fn prompt_fingerprint(prompt: &MiniPrompt) -> String {
-    format!("sha256:{}", sha256_hex(prompt.text.as_bytes()))
+    prompt_fingerprint_with_context(prompt, &audit_context_fingerprint())
+}
+
+fn prompt_fingerprint_with_context(prompt: &MiniPrompt, context: &str) -> String {
+    format!(
+        "sha256:{}",
+        sha256_hex(format!("{}\n{}", context, prompt.text).as_bytes())
+    )
 }
 
 fn update_total_duration(state: &mut AnalysisStateJson) {
@@ -1271,8 +1240,8 @@ body
 
         assert_eq!(
             *provider.calls.borrow(),
-            4,
-            "every skill should be attempted and the failed one retried once"
+            3,
+            "every skill should be attempted once"
         );
         assert_eq!(state.iterations.len(), 3);
         assert_eq!(state.iterations[0].status, "completed");
@@ -1331,9 +1300,10 @@ body
         .expect_err("a dead account should stop the run");
 
         assert!(error.to_string().contains("failed in a row"));
-        assert!(
-            state.iterations.len() < skills.len(),
-            "it must not have attempted every skill"
+        assert_eq!(
+            state.iterations.len(),
+            MAX_CONSECUTIVE_SKILL_FAILURES,
+            "the aborting failure must still be recorded"
         );
     }
 
@@ -1630,73 +1600,6 @@ body
     }
 
     #[test]
-    fn retry_pass_recovers_a_transient_failure() {
-        struct RetryProvider {
-            b_failures: std::cell::RefCell<usize>,
-        }
-
-        impl AnalysisProvider for RetryProvider {
-            fn provider_spec(&self) -> ProviderSpec {
-                ProviderSpec {
-                    name: "test".to_string(),
-                    model: None,
-                    notes: String::new(),
-                }
-            }
-
-            fn analyze_skill(
-                &self,
-                skill: &VulnerabilitySkill,
-                _prompt: &MiniPrompt,
-                _source_references: &[String],
-                _validator_context: &ValidatorContextMap,
-                _project_root: &Path,
-                _permission_prompt: &PermissionPromptSpec,
-            ) -> Result<SkillIterationResult> {
-                if skill.id == "b" && *self.b_failures.borrow() == 0 {
-                    *self.b_failures.borrow_mut() = 1;
-                    return Err(miette::miette!("transient 429"));
-                }
-                Ok(completed_result(skill))
-            }
-        }
-
-        let temp = tempfile::tempdir().expect("temp dir");
-        let state_out = temp.path().join("state.json");
-        let skills: Vec<VulnerabilitySkill> =
-            ["a", "b", "c"].iter().map(|id| skill_named(id)).collect();
-        let mut state = empty_state();
-        let provider = RetryProvider {
-            b_failures: std::cell::RefCell::new(0),
-        };
-
-        run_skill_loop(
-            &skills,
-            &mut state,
-            SkillLoopContext {
-                provider: &provider,
-                source_files: &[],
-                validator_context: &ValidatorContextMap::default(),
-                project_root: temp.path(),
-                permission_prompt: &permission_spec(temp.path()),
-                ai_logs: false,
-                state_out: &state_out,
-                resume_strict: false,
-            },
-        )
-        .expect("retry should recover the transient failure");
-
-        assert_eq!(*provider.b_failures.borrow(), 1);
-        assert_eq!(state.iterations.len(), 3);
-        assert!(
-            state
-                .iterations
-                .iter()
-                .all(|iteration| iteration.status == "completed")
-        );
-    }
-
-    #[test]
     fn resume_strict_reruns_when_provider_changes() {
         struct CountingProvider {
             calls: std::cell::RefCell<usize>,
@@ -1757,6 +1660,72 @@ body
             },
         )
         .expect("strict resume should re-run");
+
+        assert_eq!(*provider.calls.borrow(), 1);
+    }
+
+    #[test]
+    fn resume_strict_reruns_when_provider_notes_change() {
+        struct CountingProvider {
+            calls: std::cell::RefCell<usize>,
+        }
+
+        impl AnalysisProvider for CountingProvider {
+            fn provider_spec(&self) -> ProviderSpec {
+                ProviderSpec {
+                    name: "test".to_string(),
+                    model: None,
+                    notes: "current endpoint".to_string(),
+                }
+            }
+
+            fn analyze_skill(
+                &self,
+                skill: &VulnerabilitySkill,
+                _prompt: &MiniPrompt,
+                _source_references: &[String],
+                _validator_context: &ValidatorContextMap,
+                _project_root: &Path,
+                _permission_prompt: &PermissionPromptSpec,
+            ) -> Result<SkillIterationResult> {
+                *self.calls.borrow_mut() += 1;
+                Ok(completed_result(skill))
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_out = temp.path().join("state.json");
+        let skill = skill_named("a");
+        let fingerprint = prompt_fingerprint(&build_mini_prompt(&skill));
+        let mut state = empty_state();
+        let mut previous =
+            iteration_with_fingerprint("a", "completed", &fingerprint, Some("test"), Some(10));
+        previous.provider = Some(ProviderSpec {
+            name: "test".to_string(),
+            model: None,
+            notes: "old endpoint".to_string(),
+        });
+        state.iterations = vec![previous];
+
+        let provider = CountingProvider {
+            calls: std::cell::RefCell::new(0),
+        };
+
+        run_skill_loop(
+            std::slice::from_ref(&skill),
+            &mut state,
+            SkillLoopContext {
+                provider: &provider,
+                source_files: &[],
+                validator_context: &ValidatorContextMap::default(),
+                project_root: temp.path(),
+                permission_prompt: &permission_spec(temp.path()),
+                ai_logs: false,
+                state_out: &state_out,
+                resume_strict: true,
+            },
+        )
+        .expect("strict resume should re-run on endpoint change");
 
         assert_eq!(*provider.calls.borrow(), 1);
     }
@@ -1885,6 +1854,16 @@ body
                 .iterations
                 .iter()
                 .all(|iteration| iteration.provider.is_some())
+        );
+    }
+
+    #[test]
+    fn prompt_fingerprint_includes_audit_context() {
+        let prompt = build_mini_prompt(&skill_named("a"));
+
+        assert_ne!(
+            prompt_fingerprint_with_context(&prompt, "context-a"),
+            prompt_fingerprint_with_context(&prompt, "context-b")
         );
     }
 }

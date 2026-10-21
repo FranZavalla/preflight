@@ -119,7 +119,7 @@ preflight --provider ollama --model llama3.1
 preflight --provider openai --resume
 ```
 
-Resume reuses completed iterations whose skill content is unchanged, re-runs skills that changed or failed, and refuses to resume if the source files changed. Use `--resume-strict` to re-run completed skills when the provider or model changed. Run without `--resume` for a fresh audit.
+Resume reuses completed iterations whose skill content is unchanged, re-runs skills that changed or failed, and refuses to resume if the source files changed. Use `--resume-strict` to re-run completed skills when the provider, model, or endpoint changed. Results are reused only within the same preflight build and prompt-template set; upgrading preflight re-runs completed skills. Run without `--resume` for a fresh audit.
 
 ### Permission scoping
 
