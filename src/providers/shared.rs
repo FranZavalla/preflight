@@ -1233,6 +1233,9 @@ pub(super) fn iteration_from_parsed(
         status,
         findings,
         next_prompt,
+        skill_fingerprint: None,
+        provider: None,
+        duration_ms: None,
         token_usage,
     }
 }
