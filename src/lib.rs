@@ -229,7 +229,7 @@ fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
     // useful findings and the state file records what was covered.
     let loop_result = run_skill_loop(&skills, &mut state, skill_loop_context);
 
-    let report = build_report(&state);
+    let report = build_report(&state, &skills, loop_result.is_err());
     let report_markdown = render_report_markdown(&report);
     write_text_file(&report_out, &report_markdown)?;
 
@@ -351,6 +351,7 @@ fn run_skill_loop(
                     skill_fingerprint: Some(fingerprint),
                     provider: Some(provider_spec.clone()),
                     duration_ms: Some(started.elapsed().as_millis() as u64),
+                    analysis_summary: None,
                     token_usage: crate::model::TokenUsage::default(),
                 };
 
@@ -753,7 +754,11 @@ fn build_permission_prompt_spec(
     }
 }
 
-fn build_report(state: &AnalysisStateJson) -> VulnerabilityReportSpec {
+fn build_report(
+    state: &AnalysisStateJson,
+    skills: &[VulnerabilitySkill],
+    incomplete: bool,
+) -> VulnerabilityReportSpec {
     let findings = state
         .iterations
         .iter()
@@ -763,8 +768,144 @@ fn build_report(state: &AnalysisStateJson) -> VulnerabilityReportSpec {
     VulnerabilityReportSpec {
         title: "Vulnerability Report".to_string(),
         generated_at: chrono::Utc::now().to_rfc3339(),
+        coverage_markdown: render_coverage_markdown(state, skills, findings.len(), incomplete),
         findings,
     }
+}
+
+/// Renders what was and was not covered. A report that only lists findings
+/// silently reads as "everything was checked and nothing else was found", even
+/// when a skill failed or never ran -- so failures and gaps belong in the
+/// report next to the findings.
+fn render_coverage_markdown(
+    state: &AnalysisStateJson,
+    skills: &[VulnerabilitySkill],
+    findings_count: usize,
+    incomplete: bool,
+) -> String {
+    let mut completed = 0usize;
+    let mut failed = 0usize;
+    let mut unsupported = 0usize;
+    let mut scaffolded = 0usize;
+    let mut not_run = 0usize;
+    let mut skill_lines = Vec::new();
+
+    for skill in skills {
+        let iteration = state
+            .iterations
+            .iter()
+            .rev()
+            .find(|iteration| iteration.skill_id == skill.id);
+
+        let (status, findings, summary) = match iteration {
+            Some(iteration) => (
+                iteration.status.as_str(),
+                iteration.findings.len(),
+                iteration.analysis_summary.as_deref(),
+            ),
+            None => ("not run", 0, None),
+        };
+
+        match status {
+            "completed" => completed += 1,
+            "failed" => failed += 1,
+            "unsupported-skill" => unsupported += 1,
+            "scaffolded" => scaffolded += 1,
+            "not run" => not_run += 1,
+            _ => {}
+        }
+
+        let provider = iteration
+            .and_then(|iteration| iteration.provider.as_ref())
+            .map(format_provider)
+            .unwrap_or_else(|| "provider unknown".to_string());
+        let duration = iteration
+            .and_then(|iteration| iteration.duration_ms)
+            .map(format_duration_ms)
+            .unwrap_or_else(|| "time unknown".to_string());
+        let summary = summary
+            .map(|value| format!(" — summary: {}", truncate_summary_text(value)))
+            .unwrap_or_default();
+
+        skill_lines.push(format!(
+            "- `{}` — {} — {} finding(s) — {} — {}{}",
+            skill.id, status, findings, provider, duration, summary
+        ));
+    }
+
+    let ignored = state
+        .iterations
+        .iter()
+        .filter(|iteration| !skills.iter().any(|skill| skill.id == iteration.skill_id))
+        .count();
+
+    let mut coverage = String::new();
+    if incomplete {
+        coverage.push_str("- Status: INCOMPLETE — the skill loop stopped early.\n");
+    }
+    coverage.push_str(&format!(
+        "- Skills: {} completed, {} failed, {} unsupported, {} scaffolded, {} not run ({} total)\n\
+         - Source files analyzed: {}\n\
+         - Findings: {}\n\
+         - Total tokens: {}\n\
+         - Total time: {}",
+        completed,
+        failed,
+        unsupported,
+        scaffolded,
+        not_run,
+        skills.len(),
+        state.source_files.len(),
+        findings_count,
+        format_total_token_usage(&state.total_token_usage),
+        format_duration_ms(state.total_duration_ms),
+    ));
+
+    if ignored > 0 {
+        coverage.push_str(&format!(
+            "\n- Stale iterations ignored (skill no longer loaded): {}",
+            ignored
+        ));
+    }
+
+    if !skill_lines.is_empty() {
+        coverage.push_str("\n\n### Skill results\n\n");
+        coverage.push_str(&skill_lines.join("\n"));
+    }
+
+    coverage
+}
+
+fn format_provider(provider: &ProviderSpec) -> String {
+    match &provider.model {
+        Some(model) => format!("{} ({})", provider.name, model),
+        None => provider.name.clone(),
+    }
+}
+
+fn format_duration_ms(milliseconds: u64) -> String {
+    if milliseconds < 1_000 {
+        return format!("{}ms", milliseconds);
+    }
+
+    let seconds = milliseconds as f64 / 1_000.0;
+    if seconds < 60.0 {
+        format!("{:.1}s", seconds)
+    } else {
+        let total_seconds = milliseconds / 1_000;
+        format!("{}m {}s", total_seconds / 60, total_seconds % 60)
+    }
+}
+
+fn truncate_summary_text(summary: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    let summary = summary.trim().replace('\n', " ");
+    if summary.chars().count() <= MAX_CHARS {
+        return summary;
+    }
+
+    let truncated = summary.chars().take(MAX_CHARS).collect::<String>();
+    format!("{}…", truncated)
 }
 
 fn load_skills(skills_dir: &Path, skills_dir_arg: &str) -> Result<Vec<VulnerabilitySkill>> {
@@ -969,6 +1110,7 @@ fn render_report_markdown(report: &VulnerabilityReportSpec) -> String {
 
     template
         .replace("{{ generated_at }}", &report.generated_at)
+        .replace("{{ coverage_markdown }}", &report.coverage_markdown)
         .replace("{{ findings_markdown }}", &findings_markdown)
 }
 
@@ -1208,6 +1350,7 @@ body
                     skill_fingerprint: None,
                     provider: None,
                     duration_ms: None,
+                    analysis_summary: None,
                     token_usage: crate::model::TokenUsage::default(),
                 })
             }
@@ -1339,6 +1482,7 @@ body
                 notes: String::new(),
             }),
             duration_ms,
+            analysis_summary: None,
             token_usage: crate::model::TokenUsage::default(),
         }
     }
@@ -1352,6 +1496,7 @@ body
             skill_fingerprint: None,
             provider: None,
             duration_ms: None,
+            analysis_summary: None,
             token_usage: crate::model::TokenUsage::default(),
         }
     }
@@ -1865,5 +2010,91 @@ body
             prompt_fingerprint_with_context(&prompt, "context-a"),
             prompt_fingerprint_with_context(&prompt, "context-b")
         );
+    }
+
+    #[test]
+    fn report_coverage_lists_statuses_models_times_and_summaries() {
+        let skills = vec![skill_named("a"), skill_named("b"), skill_named("c")];
+        let mut completed =
+            iteration_with_fingerprint("a", "completed", "sha256:a", Some("openai"), Some(1_500));
+        completed.provider = Some(ProviderSpec {
+            name: "openai".to_string(),
+            model: Some("gpt-5".to_string()),
+            notes: String::new(),
+        });
+        completed.analysis_summary = Some("checked the spend path".to_string());
+
+        let failed =
+            iteration_with_fingerprint("b", "failed", "sha256:b", Some("anthropic"), Some(2_500));
+
+        let mut state = empty_state();
+        state.source_files = vec!["validators/spend.ak".to_string()];
+        state.iterations = vec![completed, failed];
+        state.total_duration_ms = 4_000;
+        state.total_token_usage = crate::model::TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            ..Default::default()
+        };
+
+        let report = build_report(&state, &skills, false);
+
+        assert!(report.coverage_markdown.contains("1 completed"));
+        assert!(report.coverage_markdown.contains("1 failed"));
+        assert!(report.coverage_markdown.contains("1 not run"));
+        assert!(report.coverage_markdown.contains("openai (gpt-5)"));
+        assert!(report.coverage_markdown.contains("1.5s"));
+        assert!(report.coverage_markdown.contains("anthropic"));
+        assert!(report.coverage_markdown.contains("2.5s"));
+        assert!(report.coverage_markdown.contains("checked the spend path"));
+        assert!(report.coverage_markdown.contains("Total time: 4.0s"));
+
+        let markdown = render_report_markdown(&report);
+        assert!(markdown.contains("## Coverage"));
+        assert!(markdown.contains("1 not run"));
+    }
+
+    #[test]
+    fn report_coverage_marks_incomplete_audits() {
+        let skills = vec![skill_named("a"), skill_named("b")];
+        let mut state = empty_state();
+        state.iterations = vec![iteration_with_fingerprint(
+            "a",
+            "failed",
+            "sha256:a",
+            Some("test"),
+            Some(10),
+        )];
+
+        let report = build_report(&state, &skills, true);
+
+        assert!(report.coverage_markdown.contains("Status: INCOMPLETE"));
+        assert!(report.coverage_markdown.contains("1 failed"));
+        assert!(report.coverage_markdown.contains("1 not run"));
+    }
+
+    #[test]
+    fn report_coverage_marks_unknown_provider_and_time() {
+        let skills = vec![skill_named("a")];
+        let mut state = empty_state();
+        state.iterations = vec![iteration_with_fingerprint(
+            "a",
+            "completed",
+            "sha256:a",
+            None,
+            None,
+        )];
+
+        let report = build_report(&state, &skills, false);
+
+        assert!(report.coverage_markdown.contains("provider unknown"));
+        assert!(report.coverage_markdown.contains("time unknown"));
+    }
+
+    #[test]
+    fn duration_formatting_uses_readable_units() {
+        assert_eq!(format_duration_ms(500), "500ms");
+        assert_eq!(format_duration_ms(1_500), "1.5s");
+        assert_eq!(format_duration_ms(65_000), "1m 5s");
     }
 }

@@ -48,6 +48,7 @@ impl AnalysisProvider for HeuristicProvider {
                     skill_fingerprint: None,
                     provider: None,
                     duration_ms: None,
+                    analysis_summary: None,
                     token_usage: Default::default(),
                 });
             }
@@ -61,6 +62,7 @@ impl AnalysisProvider for HeuristicProvider {
             skill_fingerprint: None,
             provider: None,
             duration_ms: None,
+            analysis_summary: None,
             token_usage: Default::default(),
         })
     }
