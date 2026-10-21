@@ -2,15 +2,17 @@ use clap::{Args as ClapArgs, ValueEnum};
 use miette::{Context, IntoDiagnostic, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 pub mod ast;
 pub mod model;
 pub mod providers;
 
-use self::ast::generate_ast_and_validator_context;
+use self::ast::{generate_ast_and_validator_context, sha256_hex};
 use self::model::{
-    AnalysisStateJson, MiniPrompt, PermissionPromptSpec, SkillIterationResult, ValidatorContextMap,
-    VulnerabilityFinding, VulnerabilityReportSpec, VulnerabilitySkill,
+    AnalysisStateJson, AstMetadata, MiniPrompt, PermissionPromptSpec, ProviderSpec,
+    SkillIterationResult, ValidatorContextMap, VulnerabilityFinding, VulnerabilityReportSpec,
+    VulnerabilitySkill,
 };
 use self::providers::shared::is_ignored_path;
 use self::providers::{AnalysisProvider, build_provider};
@@ -37,6 +39,16 @@ pub struct Args {
     /// Path where the incremental analysis state JSON will be written.
     #[arg(long, default_value = ".tx3/audit/state.json")]
     pub state_out: String,
+
+    /// Resume from the state file: skip completed skills and retry failed or
+    /// missing ones. Source changes are rejected; skills whose content changed
+    /// are re-run.
+    #[arg(long)]
+    pub resume: bool,
+
+    /// With --resume, re-run completed skills when the provider or model changed.
+    #[arg(long)]
+    pub resume_strict: bool,
 
     /// Path where the final vulnerability report markdown will be written.
     #[arg(long, default_value = ".tx3/audit/vulnerabilities.md")]
@@ -139,7 +151,7 @@ fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
     )?;
 
     let mut state = AnalysisStateJson {
-        version: "1".to_string(),
+        version: "2".to_string(),
         source_files: source_files
             .iter()
             .map(|path| path.display().to_string())
@@ -150,7 +162,44 @@ fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
         validator_context: ast_context.validator_context.clone(),
         iterations: vec![],
         total_token_usage: Default::default(),
+        total_duration_ms: 0,
     };
+
+    if args.resume {
+        match load_resume_state(&state_out, &ast_context.metadata, &skills) {
+            Ok(Some(previous)) => {
+                if previous.provider.name != state.provider.name
+                    || previous.provider.model != state.provider.model
+                {
+                    eprintln!(
+                        "⚠️  Resuming with a different provider/model; completed iterations are kept as-is."
+                    );
+                }
+
+                state.iterations = previous.iterations;
+                state.total_token_usage = previous.total_token_usage;
+                state.total_duration_ms = previous.total_duration_ms;
+                log_audit_progress(
+                    args.ai_logs,
+                    format!(
+                        "Resuming from {} • {} previous skill result(s)",
+                        state_out.display(),
+                        state.iterations.len()
+                    ),
+                );
+            }
+            Ok(None) => {
+                log_audit_progress(
+                    args.ai_logs,
+                    format!(
+                        "No previous state at {}; starting a fresh run",
+                        state_out.display()
+                    ),
+                );
+            }
+            Err(error) => return Err(error).wrap_err("Cannot resume previous state"),
+        }
+    }
 
     write_state(&state_out, &state)?;
 
@@ -162,13 +211,18 @@ fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
         provider,
         ai_logs: args.ai_logs,
         state_out: &state_out,
+        resume_strict: args.resume_strict,
     };
 
-    run_skill_loop(&skills, &mut state, skill_loop_context)?;
+    // Write the report even when the skill loop aborts: a partial run still has
+    // useful findings and the state file records what was covered.
+    let loop_result = run_skill_loop(&skills, &mut state, skill_loop_context);
 
     let report = build_report(&state);
     let report_markdown = render_report_markdown(&report);
     write_text_file(&report_out, &report_markdown)?;
+
+    loop_result?;
 
     println!(
         "⚠️  EXPERIMENTAL: Audit complete. Iterations processed: {}",
@@ -195,6 +249,7 @@ struct SkillLoopContext<'a> {
     provider: &'a dyn AnalysisProvider,
     ai_logs: bool,
     state_out: &'a Path,
+    resume_strict: bool,
 }
 
 /// Consecutive skill failures tolerated before the run stops. A blocked account
@@ -213,9 +268,33 @@ fn run_skill_loop(
         .collect::<Vec<String>>();
 
     let total_skills = skills.len();
+    let provider_spec = context.provider.provider_spec();
     let mut consecutive_failures = 0usize;
 
     for (skill_idx, skill) in skills.iter().enumerate() {
+        let prompt = build_mini_prompt(skill);
+        let fingerprint = prompt_fingerprint(&prompt);
+
+        if let Some(existing) = reusable_iteration(
+            state,
+            &skill.id,
+            &fingerprint,
+            &provider_spec,
+            context.resume_strict,
+        ) {
+            log_audit_progress(
+                context.ai_logs,
+                format!(
+                    "Skill {}/{} • skipped '{}' (already {} for this skill version)",
+                    skill_idx + 1,
+                    total_skills,
+                    skill.id,
+                    existing.status
+                ),
+            );
+            continue;
+        }
+
         log_audit_progress(
             context.ai_logs,
             format!(
@@ -227,18 +306,12 @@ fn run_skill_loop(
             ),
         );
 
-        let prompt = build_mini_prompt(skill);
-        let iteration = match context.provider.analyze_skill(
-            skill,
-            &prompt,
-            &source_references,
-            context.validator_context,
-            context.project_root,
-            context.permission_prompt,
-        ) {
-            Ok(iteration) => {
+        let started = Instant::now();
+        match run_skill_once(skill, &prompt, &fingerprint, &context, &source_references) {
+            Ok(mut iteration) => {
                 consecutive_failures = 0;
-                iteration
+                iteration.duration_ms = Some(started.elapsed().as_millis() as u64);
+                record_iteration(state, iteration, &context)?;
             }
             // One skill failing must not discard every skill after it. Record the
             // failure in the state file so the gap is visible in the report, then
@@ -272,38 +345,265 @@ fn run_skill_loop(
                     status: "failed".to_string(),
                     findings: Vec::new(),
                     next_prompt: None,
+                    skill_fingerprint: Some(fingerprint),
+                    provider: Some(provider_spec.clone()),
+                    duration_ms: Some(started.elapsed().as_millis() as u64),
                     token_usage: crate::model::TokenUsage::default(),
                 };
 
-                append_iteration(state, failed);
+                upsert_iteration(state, failed);
+                update_total_duration(state);
                 write_state(context.state_out, state)?;
-                continue;
             }
-        };
+        }
+    }
 
-        let findings_count = iteration.findings.len();
-        let status = iteration.status.clone();
-        let iteration_usage = iteration.token_usage.clone();
+    // One retry pass for transient failures. Rate limits and endpoint hiccups
+    // often clear while the remaining skills run; a blocked account fails this
+    // pass too, but it costs only one request per failed skill.
+    let failed_skill_ids = state
+        .iterations
+        .iter()
+        .filter(|iteration| iteration.status == "failed")
+        .map(|iteration| iteration.skill_id.clone())
+        .collect::<Vec<String>>();
 
-        append_iteration(state, iteration);
-        state.total_token_usage.add(&iteration_usage);
-        write_state(context.state_out, state)?;
+    for skill in skills
+        .iter()
+        .filter(|skill| failed_skill_ids.iter().any(|id| id == &skill.id))
+    {
+        let prompt = build_mini_prompt(skill);
+        let fingerprint = prompt_fingerprint(&prompt);
 
         log_audit_progress(
             context.ai_logs,
-            format!(
-                "Skill {}/{} • completed '{}' • status={} • findings={} • tokens=({}) • state persisted",
-                skill_idx + 1,
-                total_skills,
-                skill.id,
-                status,
-                findings_count,
-                format_total_token_usage(&iteration_usage),
-            ),
+            format!("Retrying failed skill '{}' once", skill.id),
         );
+
+        let started = Instant::now();
+        match run_skill_once(skill, &prompt, &fingerprint, &context, &source_references) {
+            Ok(mut iteration) => {
+                // Keep the time spent on the failed attempt: the retry replaces
+                // the iteration, but both attempts belong to the same run.
+                let previous_duration = state
+                    .iterations
+                    .iter()
+                    .find(|iteration| iteration.skill_id == skill.id)
+                    .and_then(|iteration| iteration.duration_ms)
+                    .unwrap_or(0);
+                iteration.duration_ms =
+                    Some(previous_duration + started.elapsed().as_millis() as u64);
+                let usage = iteration.token_usage.clone();
+                let status = iteration.status.clone();
+                let findings_count = iteration.findings.len();
+                upsert_iteration(state, iteration);
+                state.total_token_usage.add(&usage);
+                update_total_duration(state);
+                write_state(context.state_out, state)?;
+
+                log_audit_progress(
+                    context.ai_logs,
+                    format!(
+                        "Retry succeeded for '{}' • status={} • findings={} • tokens=({})",
+                        skill.id,
+                        status,
+                        findings_count,
+                        format_total_token_usage(&usage)
+                    ),
+                );
+            }
+            Err(error) => {
+                log_audit_progress(
+                    context.ai_logs,
+                    format!(
+                        "Retry failed for '{}'; keeping the recorded failure: {}",
+                        skill.id, error
+                    ),
+                );
+            }
+        }
     }
 
+    sort_iterations_by_skill_order(state, skills);
+    update_total_duration(state);
+    write_state(context.state_out, state)?;
+
     Ok(())
+}
+
+fn run_skill_once(
+    skill: &VulnerabilitySkill,
+    prompt: &MiniPrompt,
+    fingerprint: &str,
+    context: &SkillLoopContext<'_>,
+    source_references: &[String],
+) -> Result<SkillIterationResult> {
+    let mut iteration = context.provider.analyze_skill(
+        skill,
+        prompt,
+        source_references,
+        context.validator_context,
+        context.project_root,
+        context.permission_prompt,
+    )?;
+    iteration.skill_fingerprint = Some(fingerprint.to_string());
+    iteration.provider = Some(context.provider.provider_spec());
+    Ok(iteration)
+}
+
+fn record_iteration(
+    state: &mut AnalysisStateJson,
+    iteration: SkillIterationResult,
+    context: &SkillLoopContext<'_>,
+) -> Result<()> {
+    let skill_id = iteration.skill_id.clone();
+    let findings_count = iteration.findings.len();
+    let status = iteration.status.clone();
+    let iteration_usage = iteration.token_usage.clone();
+
+    upsert_iteration(state, iteration);
+    state.total_token_usage.add(&iteration_usage);
+    update_total_duration(state);
+    write_state(context.state_out, state)?;
+
+    log_audit_progress(
+        context.ai_logs,
+        format!(
+            "Skill '{}' finished • status={} • findings={} • tokens=({}) • state persisted",
+            skill_id,
+            status,
+            findings_count,
+            format_total_token_usage(&iteration_usage)
+        ),
+    );
+
+    Ok(())
+}
+
+fn upsert_iteration(state: &mut AnalysisStateJson, iteration: SkillIterationResult) {
+    if let Some(existing) = state
+        .iterations
+        .iter_mut()
+        .find(|existing| existing.skill_id == iteration.skill_id)
+    {
+        *existing = iteration;
+    } else {
+        state.iterations.push(iteration);
+    }
+}
+
+fn reusable_iteration<'a>(
+    state: &'a AnalysisStateJson,
+    skill_id: &str,
+    fingerprint: &str,
+    current_provider: &ProviderSpec,
+    strict: bool,
+) -> Option<&'a SkillIterationResult> {
+    state.iterations.iter().rev().find(|iteration| {
+        iteration.skill_id == skill_id
+            && iteration.skill_fingerprint.as_deref() == Some(fingerprint)
+            && iteration_is_reusable(&iteration.status, &current_provider.name)
+            && (!strict || provider_matches(iteration.provider.as_ref(), current_provider))
+    })
+}
+
+fn iteration_is_reusable(status: &str, provider_name: &str) -> bool {
+    match status {
+        "completed" => true,
+        // These statuses are terminal only for the provider that produced them.
+        "unsupported-skill" => provider_name == "heuristic",
+        "scaffolded" => provider_name == "scaffold",
+        _ => false,
+    }
+}
+
+fn provider_matches(previous: Option<&ProviderSpec>, current: &ProviderSpec) -> bool {
+    previous
+        .is_some_and(|previous| previous.name == current.name && previous.model == current.model)
+}
+
+fn sort_iterations_by_skill_order(state: &mut AnalysisStateJson, skills: &[VulnerabilitySkill]) {
+    state.iterations.sort_by_key(|iteration| {
+        skills
+            .iter()
+            .position(|skill| skill.id == iteration.skill_id)
+            .unwrap_or(usize::MAX)
+    });
+}
+
+fn prompt_fingerprint(prompt: &MiniPrompt) -> String {
+    format!("sha256:{}", sha256_hex(prompt.text.as_bytes()))
+}
+
+fn update_total_duration(state: &mut AnalysisStateJson) {
+    state.total_duration_ms = state
+        .iterations
+        .iter()
+        .filter_map(|iteration| iteration.duration_ms)
+        .sum();
+}
+
+fn load_resume_state(
+    state_out: &Path,
+    current_ast: &AstMetadata,
+    skills: &[VulnerabilitySkill],
+) -> Result<Option<AnalysisStateJson>> {
+    if !state_out.exists() {
+        return Ok(None);
+    }
+
+    let text = std::fs::read_to_string(state_out)
+        .into_diagnostic()
+        .with_context(|| format!("Failed to read state file {}", state_out.display()))?;
+    let mut previous: AnalysisStateJson = serde_json::from_str(&text)
+        .into_diagnostic()
+        .with_context(|| format!("Failed to parse state file {}", state_out.display()))?;
+
+    if previous.version != "2" {
+        return Err(miette::miette!(
+            "State file {} uses unsupported version '{}' (expected '2'); run without --resume for a fresh audit",
+            state_out.display(),
+            previous.version
+        ));
+    }
+
+    let previous_source_fingerprint = previous
+        .ast
+        .as_ref()
+        .map(|ast| ast.source_fingerprint.as_str())
+        .unwrap_or_default();
+
+    if previous_source_fingerprint.is_empty() || current_ast.source_fingerprint.is_empty() {
+        return Err(miette::miette!(
+            "State file {} has no source fingerprint; run without --resume for a fresh audit",
+            state_out.display()
+        ));
+    }
+
+    if previous_source_fingerprint != current_ast.source_fingerprint {
+        return Err(miette::miette!(
+            "Sources changed since {} was written; run without --resume for a fresh audit",
+            state_out.display()
+        ));
+    }
+
+    // Keep one iteration per currently loaded skill, in the current skill order.
+    // Iterations for removed skills are dropped so their findings cannot leak
+    // into the report.
+    let mut kept = Vec::new();
+    for skill in skills {
+        if let Some(iteration) = previous
+            .iterations
+            .iter()
+            .rev()
+            .find(|iteration| iteration.skill_id == skill.id)
+        {
+            kept.push(iteration.clone());
+        }
+    }
+    previous.iterations = kept;
+
+    Ok(Some(previous))
 }
 
 fn format_total_token_usage(usage: &crate::model::TokenUsage) -> String {
@@ -376,10 +676,6 @@ fn discover_source_files(project_root: &Path) -> Result<Vec<PathBuf>> {
 
     files.sort();
     Ok(files)
-}
-
-fn append_iteration(state: &mut AnalysisStateJson, iteration: SkillIterationResult) {
-    state.iterations.push(iteration);
 }
 
 fn build_mini_prompt(skill: &VulnerabilitySkill) -> MiniPrompt {
@@ -882,7 +1178,7 @@ body
 
     fn empty_state() -> AnalysisStateJson {
         AnalysisStateJson {
-            version: "1".to_string(),
+            version: "2".to_string(),
             source_files: Vec::new(),
             provider: crate::model::ProviderSpec {
                 name: "test".to_string(),
@@ -902,6 +1198,7 @@ body
             validator_context: ValidatorContextMap::default(),
             iterations: Vec::new(),
             total_token_usage: crate::model::TokenUsage::default(),
+            total_duration_ms: 0,
         }
     }
 
@@ -939,6 +1236,9 @@ body
                     status: "completed".to_string(),
                     findings: Vec::new(),
                     next_prompt: None,
+                    skill_fingerprint: None,
+                    provider: None,
+                    duration_ms: None,
                     token_usage: crate::model::TokenUsage::default(),
                 })
             }
@@ -964,14 +1264,15 @@ body
                 permission_prompt: &permission_spec(temp.path()),
                 ai_logs: false,
                 state_out: &state_out,
+                resume_strict: false,
             },
         )
         .expect("one failing skill should not abort the run");
 
         assert_eq!(
             *provider.calls.borrow(),
-            3,
-            "every skill should be attempted"
+            4,
+            "every skill should be attempted and the failed one retried once"
         );
         assert_eq!(state.iterations.len(), 3);
         assert_eq!(state.iterations[0].status, "completed");
@@ -1024,6 +1325,7 @@ body
                 permission_prompt: &permission_spec(temp.path()),
                 ai_logs: false,
                 state_out: &state_out,
+                resume_strict: false,
             },
         )
         .expect_err("a dead account should stop the run");
@@ -1032,6 +1334,557 @@ body
         assert!(
             state.iterations.len() < skills.len(),
             "it must not have attempted every skill"
+        );
+    }
+
+    fn ast_with_source_fingerprint(source_fingerprint: &str) -> AstMetadata {
+        AstMetadata {
+            path: ".tx3/audit/aiken-ast.json".to_string(),
+            fingerprint: "sha256:snapshot".to_string(),
+            source_fingerprint: source_fingerprint.to_string(),
+            generated_at: "1970-01-01T00:00:00Z".to_string(),
+            tool: crate::model::AstToolMetadata {
+                name: "aiken".to_string(),
+                version: "test".to_string(),
+            },
+        }
+    }
+
+    fn iteration_with_fingerprint(
+        skill_id: &str,
+        status: &str,
+        fingerprint: &str,
+        provider_name: Option<&str>,
+        duration_ms: Option<u64>,
+    ) -> SkillIterationResult {
+        SkillIterationResult {
+            skill_id: skill_id.to_string(),
+            status: status.to_string(),
+            findings: Vec::new(),
+            next_prompt: None,
+            skill_fingerprint: Some(fingerprint.to_string()),
+            provider: provider_name.map(|name| ProviderSpec {
+                name: name.to_string(),
+                model: None,
+                notes: String::new(),
+            }),
+            duration_ms,
+            token_usage: crate::model::TokenUsage::default(),
+        }
+    }
+
+    fn completed_result(skill: &VulnerabilitySkill) -> SkillIterationResult {
+        SkillIterationResult {
+            skill_id: skill.id.clone(),
+            status: "completed".to_string(),
+            findings: Vec::new(),
+            next_prompt: None,
+            skill_fingerprint: None,
+            provider: None,
+            duration_ms: None,
+            token_usage: crate::model::TokenUsage::default(),
+        }
+    }
+
+    #[test]
+    fn load_resume_state_returns_none_when_state_file_is_missing() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let missing = temp.path().join("missing.json");
+        let skills = vec![skill_named("a")];
+        let ast = ast_with_source_fingerprint("sha256:src");
+
+        let loaded = load_resume_state(&missing, &ast, &skills)
+            .expect("a missing state file should not be an error");
+
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn load_resume_state_rejects_version_one() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_out = temp.path().join("state.json");
+        let mut previous = empty_state();
+        previous.version = "1".to_string();
+        previous.ast = Some(ast_with_source_fingerprint("sha256:src"));
+        std::fs::write(
+            &state_out,
+            serde_json::to_string(&previous).expect("serialize state"),
+        )
+        .expect("write state");
+
+        let error = load_resume_state(
+            &state_out,
+            &ast_with_source_fingerprint("sha256:src"),
+            &[skill_named("a")],
+        )
+        .expect_err("version 1 must be rejected");
+
+        assert!(error.to_string().contains("unsupported version '1'"));
+    }
+
+    #[test]
+    fn load_resume_state_rejects_changed_sources() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_out = temp.path().join("state.json");
+        let mut previous = empty_state();
+        previous.ast = Some(ast_with_source_fingerprint("sha256:old"));
+        std::fs::write(
+            &state_out,
+            serde_json::to_string(&previous).expect("serialize state"),
+        )
+        .expect("write state");
+
+        let error = load_resume_state(
+            &state_out,
+            &ast_with_source_fingerprint("sha256:new"),
+            &[skill_named("a")],
+        )
+        .expect_err("changed sources must be rejected");
+
+        assert!(error.to_string().contains("Sources changed"));
+    }
+
+    #[test]
+    fn load_resume_state_keeps_one_iteration_per_current_skill() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_out = temp.path().join("state.json");
+        let mut previous = empty_state();
+        previous.ast = Some(ast_with_source_fingerprint("sha256:src"));
+        previous.iterations = vec![
+            iteration_with_fingerprint("a", "completed", "sha256:old-a", Some("test"), Some(10)),
+            iteration_with_fingerprint(
+                "removed",
+                "completed",
+                "sha256:removed",
+                Some("test"),
+                Some(10),
+            ),
+            iteration_with_fingerprint("a", "completed", "sha256:new-a", Some("test"), Some(20)),
+        ];
+        previous.total_token_usage = crate::model::TokenUsage {
+            input_tokens: 42,
+            ..Default::default()
+        };
+        previous.total_duration_ms = 30;
+        std::fs::write(
+            &state_out,
+            serde_json::to_string(&previous).expect("serialize state"),
+        )
+        .expect("write state");
+
+        let loaded = load_resume_state(
+            &state_out,
+            &ast_with_source_fingerprint("sha256:src"),
+            &[skill_named("a"), skill_named("b")],
+        )
+        .expect("resume should parse")
+        .expect("state should exist");
+
+        assert_eq!(loaded.iterations.len(), 1);
+        assert_eq!(loaded.iterations[0].skill_id, "a");
+        assert_eq!(
+            loaded.iterations[0].skill_fingerprint.as_deref(),
+            Some("sha256:new-a"),
+            "the latest attempt should win"
+        );
+        assert_eq!(loaded.total_token_usage.input_tokens, 42);
+        assert_eq!(loaded.total_duration_ms, 30);
+    }
+
+    #[test]
+    fn skill_loop_skips_matching_completed_skills_and_reruns_changed_ones() {
+        struct CountingProvider {
+            calls: std::cell::RefCell<Vec<String>>,
+        }
+
+        impl AnalysisProvider for CountingProvider {
+            fn provider_spec(&self) -> ProviderSpec {
+                ProviderSpec {
+                    name: "test".to_string(),
+                    model: None,
+                    notes: String::new(),
+                }
+            }
+
+            fn analyze_skill(
+                &self,
+                skill: &VulnerabilitySkill,
+                _prompt: &MiniPrompt,
+                _source_references: &[String],
+                _validator_context: &ValidatorContextMap,
+                _project_root: &Path,
+                _permission_prompt: &PermissionPromptSpec,
+            ) -> Result<SkillIterationResult> {
+                self.calls.borrow_mut().push(skill.id.clone());
+                Ok(completed_result(skill))
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_out = temp.path().join("state.json");
+        let skills: Vec<VulnerabilitySkill> =
+            ["a", "b", "c"].iter().map(|id| skill_named(id)).collect();
+        let fingerprint_a = prompt_fingerprint(&build_mini_prompt(&skills[0]));
+        let stale_fingerprint = "sha256:stale".to_string();
+
+        let mut state = empty_state();
+        state.iterations = vec![
+            iteration_with_fingerprint("a", "completed", &fingerprint_a, Some("test"), Some(5)),
+            iteration_with_fingerprint("b", "completed", &stale_fingerprint, Some("test"), Some(5)),
+        ];
+
+        let provider = CountingProvider {
+            calls: std::cell::RefCell::new(Vec::new()),
+        };
+
+        run_skill_loop(
+            &skills,
+            &mut state,
+            SkillLoopContext {
+                provider: &provider,
+                source_files: &[],
+                validator_context: &ValidatorContextMap::default(),
+                project_root: temp.path(),
+                permission_prompt: &permission_spec(temp.path()),
+                ai_logs: false,
+                state_out: &state_out,
+                resume_strict: false,
+            },
+        )
+        .expect("loop should succeed");
+
+        assert_eq!(
+            *provider.calls.borrow(),
+            vec!["b".to_string(), "c".to_string()],
+            "only changed and missing skills should run"
+        );
+        assert_eq!(state.iterations.len(), 3);
+        assert_eq!(state.iterations[0].skill_id, "a");
+    }
+
+    #[test]
+    fn skill_loop_reruns_failed_skills_loaded_from_state() {
+        struct AlwaysOkProvider {
+            calls: std::cell::RefCell<usize>,
+        }
+
+        impl AnalysisProvider for AlwaysOkProvider {
+            fn provider_spec(&self) -> ProviderSpec {
+                ProviderSpec {
+                    name: "test".to_string(),
+                    model: None,
+                    notes: String::new(),
+                }
+            }
+
+            fn analyze_skill(
+                &self,
+                skill: &VulnerabilitySkill,
+                _prompt: &MiniPrompt,
+                _source_references: &[String],
+                _validator_context: &ValidatorContextMap,
+                _project_root: &Path,
+                _permission_prompt: &PermissionPromptSpec,
+            ) -> Result<SkillIterationResult> {
+                *self.calls.borrow_mut() += 1;
+                Ok(completed_result(skill))
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_out = temp.path().join("state.json");
+        let skill = skill_named("a");
+        let fingerprint = prompt_fingerprint(&build_mini_prompt(&skill));
+        let mut state = empty_state();
+        state.iterations = vec![iteration_with_fingerprint(
+            "a",
+            "failed",
+            &fingerprint,
+            Some("test"),
+            Some(10),
+        )];
+
+        let provider = AlwaysOkProvider {
+            calls: std::cell::RefCell::new(0),
+        };
+
+        run_skill_loop(
+            std::slice::from_ref(&skill),
+            &mut state,
+            SkillLoopContext {
+                provider: &provider,
+                source_files: &[],
+                validator_context: &ValidatorContextMap::default(),
+                project_root: temp.path(),
+                permission_prompt: &permission_spec(temp.path()),
+                ai_logs: false,
+                state_out: &state_out,
+                resume_strict: false,
+            },
+        )
+        .expect("failed skill should be retried");
+
+        assert_eq!(*provider.calls.borrow(), 1);
+        assert_eq!(state.iterations.len(), 1);
+        assert_eq!(state.iterations[0].status, "completed");
+    }
+
+    #[test]
+    fn retry_pass_recovers_a_transient_failure() {
+        struct RetryProvider {
+            b_failures: std::cell::RefCell<usize>,
+        }
+
+        impl AnalysisProvider for RetryProvider {
+            fn provider_spec(&self) -> ProviderSpec {
+                ProviderSpec {
+                    name: "test".to_string(),
+                    model: None,
+                    notes: String::new(),
+                }
+            }
+
+            fn analyze_skill(
+                &self,
+                skill: &VulnerabilitySkill,
+                _prompt: &MiniPrompt,
+                _source_references: &[String],
+                _validator_context: &ValidatorContextMap,
+                _project_root: &Path,
+                _permission_prompt: &PermissionPromptSpec,
+            ) -> Result<SkillIterationResult> {
+                if skill.id == "b" && *self.b_failures.borrow() == 0 {
+                    *self.b_failures.borrow_mut() = 1;
+                    return Err(miette::miette!("transient 429"));
+                }
+                Ok(completed_result(skill))
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_out = temp.path().join("state.json");
+        let skills: Vec<VulnerabilitySkill> =
+            ["a", "b", "c"].iter().map(|id| skill_named(id)).collect();
+        let mut state = empty_state();
+        let provider = RetryProvider {
+            b_failures: std::cell::RefCell::new(0),
+        };
+
+        run_skill_loop(
+            &skills,
+            &mut state,
+            SkillLoopContext {
+                provider: &provider,
+                source_files: &[],
+                validator_context: &ValidatorContextMap::default(),
+                project_root: temp.path(),
+                permission_prompt: &permission_spec(temp.path()),
+                ai_logs: false,
+                state_out: &state_out,
+                resume_strict: false,
+            },
+        )
+        .expect("retry should recover the transient failure");
+
+        assert_eq!(*provider.b_failures.borrow(), 1);
+        assert_eq!(state.iterations.len(), 3);
+        assert!(
+            state
+                .iterations
+                .iter()
+                .all(|iteration| iteration.status == "completed")
+        );
+    }
+
+    #[test]
+    fn resume_strict_reruns_when_provider_changes() {
+        struct CountingProvider {
+            calls: std::cell::RefCell<usize>,
+        }
+
+        impl AnalysisProvider for CountingProvider {
+            fn provider_spec(&self) -> ProviderSpec {
+                ProviderSpec {
+                    name: "test".to_string(),
+                    model: None,
+                    notes: String::new(),
+                }
+            }
+
+            fn analyze_skill(
+                &self,
+                skill: &VulnerabilitySkill,
+                _prompt: &MiniPrompt,
+                _source_references: &[String],
+                _validator_context: &ValidatorContextMap,
+                _project_root: &Path,
+                _permission_prompt: &PermissionPromptSpec,
+            ) -> Result<SkillIterationResult> {
+                *self.calls.borrow_mut() += 1;
+                Ok(completed_result(skill))
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_out = temp.path().join("state.json");
+        let skill = skill_named("a");
+        let fingerprint = prompt_fingerprint(&build_mini_prompt(&skill));
+        let mut state = empty_state();
+        state.iterations = vec![iteration_with_fingerprint(
+            "a",
+            "completed",
+            &fingerprint,
+            Some("other-provider"),
+            Some(10),
+        )];
+
+        let provider = CountingProvider {
+            calls: std::cell::RefCell::new(0),
+        };
+
+        run_skill_loop(
+            std::slice::from_ref(&skill),
+            &mut state,
+            SkillLoopContext {
+                provider: &provider,
+                source_files: &[],
+                validator_context: &ValidatorContextMap::default(),
+                project_root: temp.path(),
+                permission_prompt: &permission_spec(temp.path()),
+                ai_logs: false,
+                state_out: &state_out,
+                resume_strict: true,
+            },
+        )
+        .expect("strict resume should re-run");
+
+        assert_eq!(*provider.calls.borrow(), 1);
+    }
+
+    #[test]
+    fn resume_reuses_by_default_when_provider_changes() {
+        struct CountingProvider {
+            calls: std::cell::RefCell<usize>,
+        }
+
+        impl AnalysisProvider for CountingProvider {
+            fn provider_spec(&self) -> ProviderSpec {
+                ProviderSpec {
+                    name: "test".to_string(),
+                    model: None,
+                    notes: String::new(),
+                }
+            }
+
+            fn analyze_skill(
+                &self,
+                skill: &VulnerabilitySkill,
+                _prompt: &MiniPrompt,
+                _source_references: &[String],
+                _validator_context: &ValidatorContextMap,
+                _project_root: &Path,
+                _permission_prompt: &PermissionPromptSpec,
+            ) -> Result<SkillIterationResult> {
+                *self.calls.borrow_mut() += 1;
+                Ok(completed_result(skill))
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_out = temp.path().join("state.json");
+        let skill = skill_named("a");
+        let fingerprint = prompt_fingerprint(&build_mini_prompt(&skill));
+        let mut state = empty_state();
+        state.iterations = vec![iteration_with_fingerprint(
+            "a",
+            "completed",
+            &fingerprint,
+            Some("other-provider"),
+            Some(10),
+        )];
+
+        let provider = CountingProvider {
+            calls: std::cell::RefCell::new(0),
+        };
+
+        run_skill_loop(
+            std::slice::from_ref(&skill),
+            &mut state,
+            SkillLoopContext {
+                provider: &provider,
+                source_files: &[],
+                validator_context: &ValidatorContextMap::default(),
+                project_root: temp.path(),
+                permission_prompt: &permission_spec(temp.path()),
+                ai_logs: false,
+                state_out: &state_out,
+                resume_strict: false,
+            },
+        )
+        .expect("default resume should reuse");
+
+        assert_eq!(*provider.calls.borrow(), 0);
+    }
+
+    #[test]
+    fn duration_is_recorded_per_skill_and_total() {
+        struct OkProvider;
+
+        impl AnalysisProvider for OkProvider {
+            fn provider_spec(&self) -> ProviderSpec {
+                ProviderSpec {
+                    name: "test".to_string(),
+                    model: None,
+                    notes: String::new(),
+                }
+            }
+
+            fn analyze_skill(
+                &self,
+                skill: &VulnerabilitySkill,
+                _prompt: &MiniPrompt,
+                _source_references: &[String],
+                _validator_context: &ValidatorContextMap,
+                _project_root: &Path,
+                _permission_prompt: &PermissionPromptSpec,
+            ) -> Result<SkillIterationResult> {
+                Ok(completed_result(skill))
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_out = temp.path().join("state.json");
+        let skills: Vec<VulnerabilitySkill> = ["a", "b"].iter().map(|id| skill_named(id)).collect();
+        let mut state = empty_state();
+
+        run_skill_loop(
+            &skills,
+            &mut state,
+            SkillLoopContext {
+                provider: &OkProvider,
+                source_files: &[],
+                validator_context: &ValidatorContextMap::default(),
+                project_root: temp.path(),
+                permission_prompt: &permission_spec(temp.path()),
+                ai_logs: false,
+                state_out: &state_out,
+                resume_strict: false,
+            },
+        )
+        .expect("loop should succeed");
+
+        let durations = state
+            .iterations
+            .iter()
+            .map(|iteration| iteration.duration_ms.expect("duration recorded"))
+            .collect::<Vec<u64>>();
+        assert_eq!(durations.len(), 2);
+        assert_eq!(state.total_duration_ms, durations.iter().sum::<u64>());
+        assert!(
+            state
+                .iterations
+                .iter()
+                .all(|iteration| iteration.provider.is_some())
         );
     }
 }

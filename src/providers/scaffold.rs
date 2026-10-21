@@ -39,6 +39,9 @@ impl AnalysisProvider for ScaffoldProvider {
                     skill.id, prompt.text
                 ),
             }),
+            skill_fingerprint: None,
+            provider: None,
+            duration_ms: None,
             token_usage: Default::default(),
         })
     }

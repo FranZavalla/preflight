@@ -72,6 +72,7 @@ pub fn generate_ast_and_validator_context(
                 metadata: AstMetadata {
                     path: display_path_for_state(project_root, ast_out_path),
                     fingerprint: format!("sha256:{}", sha256_hex(cached_text.as_bytes())),
+                    source_fingerprint: source_fingerprint.clone(),
                     generated_at: cached_snapshot.generated_at,
                     tool: cached_snapshot.tool,
                 },
@@ -131,7 +132,7 @@ pub fn generate_ast_and_validator_context(
             name: "aiken".to_string(),
             version: version::compiler_version(false),
         },
-        source_fingerprint,
+        source_fingerprint: source_fingerprint.clone(),
         files,
         validator_context: validator_context.clone(),
     };
@@ -143,6 +144,7 @@ pub fn generate_ast_and_validator_context(
         metadata: AstMetadata {
             path: display_path_for_state(project_root, ast_out_path),
             fingerprint: format!("sha256:{}", sha256_hex(serialized_snapshot.as_bytes())),
+            source_fingerprint,
             generated_at: snapshot.generated_at,
             tool: snapshot.tool,
         },
@@ -346,7 +348,7 @@ fn display_path_for_state(project_root: &Path, path: &Path) -> String {
         .unwrap_or_else(|_| path.display().to_string())
 }
 
-fn sha256_hex(value: &[u8]) -> String {
+pub(crate) fn sha256_hex(value: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.input(value);
     hasher.result_str()

@@ -9,7 +9,7 @@
 1. **Source discovery** — recursively scans the working directory for `.ak` files (skipping `target/`, `build/`, `.git/`, `.tx3/`, and nested projects with their own `aiken.toml`).
 2. **AST generation** — parses each source file with `aiken-lang`, builds a per-validator context (handlers, parameters, source spans), and caches the snapshot to `.tx3/audit/aiken-ast.json`.
 3. **Skill loop** — for each vulnerability skill (markdown files with YAML frontmatter), invokes the configured provider with the skill prompt and AST context. The provider returns findings (or asks for additional file reads via a tool-call loop).
-4. **Persistence** — after every skill iteration, the analysis state is written to `.tx3/audit/state.json` so partial progress survives interruptions.
+4. **Persistence** — after every skill iteration, the analysis state is written to `.tx3/audit/state.json`. Pass `--resume` to skip completed skills and retry failed or missing ones after an interruption.
 5. **Report** — once all skills finish, a markdown report is rendered to `.tx3/audit/vulnerabilities.md`.
 
 ## Installation
@@ -113,6 +113,14 @@ preflight --provider anthropic --model claude-opus-4-7 --reasoning-effort max
 preflight --provider ollama --model llama3.1
 ```
 
+**Resume an interrupted audit**
+
+```bash
+preflight --provider openai --resume
+```
+
+Resume reuses completed iterations whose skill content is unchanged, re-runs skills that changed or failed, and refuses to resume if the source files changed. Use `--resume-strict` to re-run completed skills when the provider or model changed. Run without `--resume` for a fresh audit.
+
 ### Permission scoping
 
 When the AI provider asks to read additional files, requests are gated:
@@ -168,6 +176,8 @@ preflight [OPTIONS]
 
   --skills-dir <PATH>             Vulnerability skills directory.            [default: skills/vulnerabilities]
   --state-out <PATH>              Incremental state JSON path.               [default: .tx3/audit/state.json]
+  --resume                        Resume from --state-out: skip completed skills, retry failed/missing ones.
+  --resume-strict                 With --resume, re-run completed skills when provider/model changed.
   --report-out <PATH>             Final markdown report path.                [default: .tx3/audit/vulnerabilities.md]
   --ast-out <PATH>                AST snapshot JSON path.                    [default: .tx3/audit/aiken-ast.json]
   --no-ast-cache                  Force regeneration of the AST snapshot.

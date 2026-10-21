@@ -27,6 +27,17 @@ pub struct SkillIterationResult {
     pub status: String,
     pub findings: Vec<VulnerabilityFinding>,
     pub next_prompt: Option<MiniPrompt>,
+    /// Hash of the skill content used for this iteration. Resume uses it to
+    /// re-run a skill whose definition changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_fingerprint: Option<String>,
+    /// Provider and model that produced this iteration. Kept per iteration so
+    /// resumed runs can show mixed provenance and apply strict reuse rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderSpec>,
+    /// Wall-clock time spent on this skill, including tool calls and retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "TokenUsage::is_empty")]
     pub token_usage: TokenUsage,
 }
@@ -102,12 +113,18 @@ pub struct AnalysisStateJson {
     pub iterations: Vec<SkillIterationResult>,
     #[serde(default, skip_serializing_if = "TokenUsage::is_empty")]
     pub total_token_usage: TokenUsage,
+    /// Sum of the per-skill durations recorded in this state.
+    #[serde(default)]
+    pub total_duration_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AstMetadata {
     pub path: String,
     pub fingerprint: String,
+    /// Fingerprint of the source files that produced this AST snapshot.
+    #[serde(default)]
+    pub source_fingerprint: String,
     pub generated_at: String,
     pub tool: AstToolMetadata,
 }
@@ -297,6 +314,9 @@ mod tests {
             status: "completed".to_string(),
             findings: vec![],
             next_prompt: None,
+            skill_fingerprint: None,
+            provider: None,
+            duration_ms: None,
             token_usage: TokenUsage::default(),
         };
         let json_iter = serde_json::to_string(&iter).expect("serialize");
@@ -312,6 +332,9 @@ mod tests {
             status: "completed".to_string(),
             findings: vec![],
             next_prompt: None,
+            skill_fingerprint: None,
+            provider: None,
+            duration_ms: None,
             token_usage: TokenUsage {
                 input_tokens: 123,
                 output_tokens: 45,
