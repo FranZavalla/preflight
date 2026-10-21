@@ -193,54 +193,26 @@ fn parse_retry_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     Some(Duration::from_millis(millis).min(RATE_LIMIT_MAX_DELAY))
 }
 
-fn classify_provider_error_text(
-    message: &str,
-    error_type: &str,
-    retry_after: Option<Duration>,
-) -> AttemptFailure {
-    let lowered = format!("{} {}", message, error_type).to_ascii_lowercase();
-
-    let account_markers = [
-        "credit",
-        "billing",
-        "authentication",
-        "permission",
-        "invalid api key",
-        "insufficient",
-    ];
-    let rate_markers = [
-        "rate limit",
-        "too many requests",
-        "overloaded",
-        "rate_limit",
-        "429",
-        "500",
-        "502",
-        "503",
-        "504",
-    ];
-
-    let kind = if account_markers
-        .iter()
-        .any(|marker| lowered.contains(marker))
-    {
-        FailureKind::Fatal
-    } else if rate_markers.iter().any(|marker| lowered.contains(marker)) {
-        FailureKind::RateLimited
-    } else {
-        FailureKind::NextVariant
-    };
-
-    AttemptFailure {
-        report: miette::miette!("AI provider error: {}", message),
-        kind,
-        retry_after,
-    }
+struct ProviderError {
+    message: String,
+    code: Option<String>,
+    error_type: Option<String>,
 }
 
-/// Detects provider errors delivered inside a successful (200) response, both
-/// SSE `error` events and JSON bodies with an `/error` pointer.
-fn classify_in_band_error(value: &Value, retry_after: Option<Duration>) -> Option<AttemptFailure> {
+fn json_scalar_to_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .or_else(|| value.as_u64().map(|number| number.to_string()))
+}
+
+fn extract_provider_error(value: &Value) -> Option<ProviderError> {
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let explicit_event = event_type == "error" || event_type == "response.failed";
+
     let error_value = value
         .get("error")
         .filter(|error| !error.is_null())
@@ -249,38 +221,177 @@ fn classify_in_band_error(value: &Value, retry_after: Option<Duration>) -> Optio
                 .pointer("/response/error")
                 .filter(|error| !error.is_null())
         });
-    let event_type = value
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
 
-    if error_value.is_none() && event_type != "error" && event_type != "response.failed" {
-        return None;
-    }
-
-    let (message, error_type) = match error_value {
-        Some(Value::Object(error)) => (
-            error
+    let (message, code, error_type) = match error_value {
+        Some(Value::Object(error)) => {
+            let message = error
                 .get("message")
                 .and_then(Value::as_str)
                 .or_else(|| value.get("message").and_then(Value::as_str))
-                .unwrap_or("provider reported an error"),
-            error
+                .unwrap_or("provider reported an error")
+                .trim()
+                .to_string();
+            let code = error
+                .get("code")
+                .and_then(json_scalar_to_string)
+                .or_else(|| error.get("status").and_then(json_scalar_to_string));
+            let error_type = error
                 .get("type")
                 .and_then(Value::as_str)
-                .or_else(|| error.get("code").and_then(Value::as_str))
-                .unwrap_or(event_type),
+                .or_else(|| explicit_event.then_some(event_type))
+                .map(ToString::to_string);
+
+            // Some providers always include `error: {}` in healthy events.
+            if message == "provider reported an error" && code.is_none() && error_type.is_none() {
+                return None;
+            }
+
+            (message, code, error_type)
+        }
+        Some(Value::String(message)) => {
+            let message = message.trim();
+            if message.is_empty() && !explicit_event {
+                return None;
+            }
+            (
+                if message.is_empty() {
+                    "provider reported an error".to_string()
+                } else {
+                    message.to_string()
+                },
+                None,
+                explicit_event.then(|| event_type.to_string()),
+            )
+        }
+        Some(_) => (
+            "provider reported an error".to_string(),
+            None,
+            explicit_event.then(|| event_type.to_string()),
         ),
-        Some(Value::String(message)) => (message.as_str(), event_type),
-        Some(_) => ("provider reported an error", event_type),
-        None => ("provider reported an error", event_type),
+        None if explicit_event => (
+            "provider reported an error".to_string(),
+            None,
+            Some(event_type.to_string()),
+        ),
+        None => return None,
     };
 
-    Some(classify_provider_error_text(
+    Some(ProviderError {
         message,
+        code,
         error_type,
+    })
+}
+
+fn classify_error_code(value: &str) -> Option<FailureKind> {
+    let normalized = value.trim().to_ascii_lowercase();
+
+    if let Ok(status) = normalized.parse::<u16>() {
+        return match status {
+            401..=403 => Some(FailureKind::Fatal),
+            408 => Some(FailureKind::Transient),
+            429 => Some(FailureKind::RateLimited),
+            500..=599 => Some(FailureKind::Transient),
+            400..=499 => Some(FailureKind::NextVariant),
+            _ => None,
+        };
+    }
+
+    let fatal = [
+        "insufficient_quota",
+        "billing",
+        "authentication",
+        "permission_error",
+        "invalid_api_key",
+        "account_deactivated",
+        "payment_required",
+        "credit_balance",
+    ];
+    let rate_limited = ["rate_limit", "too_many_requests", "rate-limit"];
+    let transient = [
+        "server_error",
+        "overloaded",
+        "service_unavailable",
+        "timeout",
+        "temporarily_unavailable",
+        "upstream_error",
+    ];
+    let next_variant = ["invalid_request", "bad_request", "unsupported"];
+
+    if fatal.iter().any(|marker| normalized.contains(marker)) {
+        Some(FailureKind::Fatal)
+    } else if rate_limited
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        Some(FailureKind::RateLimited)
+    } else if transient.iter().any(|marker| normalized.contains(marker)) {
+        Some(FailureKind::Transient)
+    } else if next_variant
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        Some(FailureKind::NextVariant)
+    } else {
+        None
+    }
+}
+
+fn classify_error_message(message: &str) -> Option<FailureKind> {
+    let lowered = message.to_ascii_lowercase();
+
+    let fatal = [
+        "credit balance",
+        "insufficient credits",
+        "insufficient_quota",
+        "billing",
+        "payment required",
+        "invalid api key",
+        "authentication",
+        "permission denied",
+        "account deactivated",
+    ];
+    let rate_limited = ["rate limit", "too many requests", "rate_limit"];
+    let transient = [
+        "overloaded",
+        "server error",
+        "service unavailable",
+        "temporarily unavailable",
+        "timeout",
+    ];
+
+    if fatal.iter().any(|marker| lowered.contains(marker)) {
+        Some(FailureKind::Fatal)
+    } else if rate_limited.iter().any(|marker| lowered.contains(marker)) {
+        Some(FailureKind::RateLimited)
+    } else if transient.iter().any(|marker| lowered.contains(marker)) {
+        Some(FailureKind::Transient)
+    } else {
+        None
+    }
+}
+
+fn classify_provider_error(error: &ProviderError, retry_after: Option<Duration>) -> AttemptFailure {
+    let kind = error
+        .code
+        .as_deref()
+        .and_then(classify_error_code)
+        .or_else(|| error.error_type.as_deref().and_then(classify_error_code))
+        .or_else(|| classify_error_message(&error.message))
+        .unwrap_or(FailureKind::NextVariant);
+
+    AttemptFailure {
+        report: miette::miette!("AI provider error: {}", error.message),
+        kind,
         retry_after,
-    ))
+    }
+}
+
+/// Detects provider errors delivered inside a successful (200) response, both
+/// SSE `error` events and JSON bodies with an `/error` pointer.
+fn classify_in_band_error(value: &Value, retry_after: Option<Duration>) -> Option<AttemptFailure> {
+    let error = extract_provider_error(value)?;
+    Some(classify_provider_error(&error, retry_after))
 }
 
 fn classify_request_failure(
@@ -1659,7 +1770,47 @@ mod tests {
 
         let failure = classify_in_band_error(&event, None).expect("should detect failure event");
 
+        assert_eq!(failure.kind, FailureKind::Transient);
+        assert!(is_retryable(&failure));
+    }
+
+    #[test]
+    fn numeric_error_code_429_is_rate_limited() {
+        let event = json!({
+            "error": {
+                "message": "slow down",
+                "code": 429
+            }
+        });
+
+        let failure = classify_in_band_error(&event, None).expect("should detect in-band error");
         assert_eq!(failure.kind, FailureKind::RateLimited);
+    }
+
+    #[test]
+    fn structured_insufficient_quota_is_fatal() {
+        let event = json!({
+            "error": {
+                "message": "quota exhausted",
+                "code": "insufficient_quota"
+            }
+        });
+
+        let failure = classify_in_band_error(&event, None).expect("should detect in-band error");
+        assert!(should_abort_turn(&failure));
+    }
+
+    #[test]
+    fn insufficient_capacity_is_not_fatal() {
+        let event = json!({
+            "error": {
+                "message": "insufficient capacity right now"
+            }
+        });
+
+        let failure = classify_in_band_error(&event, None).expect("should detect in-band error");
+        assert!(!should_abort_turn(&failure));
+        assert_eq!(failure.kind, FailureKind::NextVariant);
     }
 
     #[test]
@@ -1671,6 +1822,12 @@ mod tests {
     #[test]
     fn null_error_fields_are_ignored() {
         let event = json!({"choices": [], "error": null});
+        assert!(classify_in_band_error(&event, None).is_none());
+    }
+
+    #[test]
+    fn empty_error_objects_are_ignored() {
+        let event = json!({"choices": [], "error": {}});
         assert!(classify_in_band_error(&event, None).is_none());
     }
 
