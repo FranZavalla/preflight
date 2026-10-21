@@ -1669,6 +1669,51 @@ mod tests {
         assert!(budget.take(Duration::from_secs(4)));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn shared_budget_is_consumed_across_variants() {
+        let mut budget = RetryBudget::new(Duration::from_secs(120));
+        let first_attempts = AtomicUsize::new(0);
+
+        // Two 60s waits consume the whole turn budget.
+        let first = attempt_with_backoff(false, "Variant 1", 0, &mut budget, || {
+            first_attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err(AttemptFailure {
+                    report: miette::miette!("429 Too Many Requests"),
+                    kind: FailureKind::RateLimited,
+                    retry_after: Some(Duration::from_secs(60)),
+                })
+            }
+        })
+        .await;
+
+        assert!(first.is_err());
+        assert_eq!(
+            first_attempts.load(Ordering::SeqCst),
+            MAX_RATE_LIMIT_ATTEMPTS
+        );
+
+        let second_attempts = AtomicUsize::new(0);
+        let second = attempt_with_backoff(false, "Variant 2", 0, &mut budget, || {
+            second_attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err(AttemptFailure {
+                    report: miette::miette!("429 Too Many Requests"),
+                    kind: FailureKind::RateLimited,
+                    retry_after: Some(Duration::from_secs(10)),
+                })
+            }
+        })
+        .await;
+
+        assert!(second.is_err());
+        assert_eq!(
+            second_attempts.load(Ordering::SeqCst),
+            1,
+            "the second variant must see the exhausted turn budget"
+        );
+    }
+
     #[test]
     fn retry_delay_is_capped_per_attempt() {
         let failure = AttemptFailure {
