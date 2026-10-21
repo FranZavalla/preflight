@@ -1,6 +1,7 @@
 use miette::{Context, IntoDiagnostic, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,8 +10,8 @@ use std::time::Instant;
 use tokio::runtime::Handle;
 
 use crate::model::{
-    MiniPrompt, PermissionPromptSpec, SkillIterationResult, TokenUsage, ValidatorContextMap,
-    VulnerabilityFinding, VulnerabilitySkill,
+    FunctionContextEntry, MiniPrompt, PermissionPromptSpec, SkillIterationResult, TokenUsage,
+    ValidatorContextMap, VulnerabilityFinding, VulnerabilitySkill,
 };
 
 pub(super) const MAX_AGENT_STEPS: usize = 30;
@@ -524,11 +525,7 @@ fn render_source_references(source_references: &[String]) -> String {
 }
 
 fn render_validator_context_map(validator_context: &ValidatorContextMap) -> String {
-    if validator_context.validators.is_empty() {
-        return "- (none)".to_string();
-    }
-
-    validator_context
+    let validators_rendered = validator_context
         .validators
         .iter()
         .map(|validator| {
@@ -554,7 +551,71 @@ fn render_validator_context_map(validator_context: &ValidatorContextMap) -> Stri
             )
         })
         .collect::<Vec<String>>()
-        .join("\n")
+        .join("\n");
+
+    let helpers_rendered = render_helper_context(&validator_context.functions);
+
+    match (validators_rendered.is_empty(), helpers_rendered.is_empty()) {
+        (true, true) => "- (none)".to_string(),
+        (false, true) => validators_rendered,
+        (true, false) => helpers_rendered,
+        (false, false) => format!("{}\n\n{}", validators_rendered, helpers_rendered),
+    }
+}
+
+/// Signatures only, grouped by source file. Bodies are read on demand by the
+/// model; this block exists to make helpers discoverable without guessing which
+/// file to open.
+const MAX_HELPER_CONTEXT_CHARS: usize = 4 * 1024;
+
+fn render_helper_context(functions: &[FunctionContextEntry]) -> String {
+    if functions.is_empty() {
+        return String::new();
+    }
+
+    let mut groups: BTreeMap<&str, Vec<&FunctionContextEntry>> = BTreeMap::new();
+    for function in functions {
+        groups
+            .entry(function.source_file.as_str())
+            .or_default()
+            .push(function);
+    }
+
+    let mut lines = vec!["Top-level functions (helpers):".to_string()];
+    for (source_file, entries) in groups {
+        lines.push(format!("- `{}`", source_file));
+        for function in entries {
+            let name = function
+                .id
+                .rsplit_once('.')
+                .map(|(_, name)| name)
+                .unwrap_or(&function.id);
+            let signature = function
+                .parameters
+                .iter()
+                .map(|parameter| format!("{}: {}", parameter.name, parameter.r#type))
+                .collect::<Vec<String>>()
+                .join(", ");
+            lines.push(format!("  - `{}({})`", name, signature));
+        }
+    }
+
+    let rendered = lines.join("\n");
+    if rendered.len() <= MAX_HELPER_CONTEXT_CHARS {
+        return rendered;
+    }
+
+    let mut cut = MAX_HELPER_CONTEXT_CHARS;
+    while cut > 0 && !rendered.is_char_boundary(cut) {
+        cut -= 1;
+    }
+
+    format!(
+        "{}\n… (helper context truncated: {} of {} chars shown; use grep or read_file for the rest)",
+        &rendered[..cut],
+        cut,
+        rendered.len()
+    )
 }
 
 pub(super) fn parse_agent_action(content: &str) -> Result<AgentAction> {
@@ -1356,6 +1417,7 @@ mod tests {
                     }],
                 }],
             }],
+            functions: vec![],
         };
 
         let prompt = build_initial_user_prompt(
@@ -1371,6 +1433,69 @@ mod tests {
         assert!(prompt.contains("Validator context map:"));
         assert!(prompt.contains("validators.vesting.hello_world"));
         assert!(prompt.contains("spend(datum: Option<Datum>)"));
+    }
+
+    #[test]
+    fn initial_prompt_renders_top_level_functions() {
+        let permission_prompt = PermissionPromptSpec {
+            shell: "bash".to_string(),
+            allowed_commands: vec!["cat".to_string()],
+            scope_rules: vec![],
+            workspace_root: ".".to_string(),
+            read_scope: "workspace".to_string(),
+            interactive_permissions: false,
+            allowed_paths: vec![],
+        };
+
+        let validator_context = ValidatorContextMap {
+            validators: vec![],
+            functions: vec![FunctionContextEntry {
+                id: "validators.order.mint_unique".to_string(),
+                module: "validators/order.ak".to_string(),
+                source_file: "validators/order.ak".to_string(),
+                source_span: None,
+                parameters: vec![ValidatorParameterContext {
+                    name: "labels".to_string(),
+                    r#type: "List<AssetName>".to_string(),
+                }],
+            }],
+        };
+
+        let prompt = build_initial_user_prompt(
+            &MiniPrompt {
+                skill_id: "s1".to_string(),
+                text: "skill".to_string(),
+            },
+            &["validators/order.ak".to_string()],
+            &validator_context,
+            &permission_prompt,
+        );
+
+        assert!(prompt.contains("Top-level functions (helpers):"));
+        assert!(prompt.contains("validators/order.ak"));
+        assert!(prompt.contains("mint_unique(labels: List<AssetName>)"));
+    }
+
+    #[test]
+    fn helper_context_is_capped() {
+        let functions = (0..200)
+            .map(|index| FunctionContextEntry {
+                id: format!("validators.big.helper_{}", index),
+                module: "validators/big.ak".to_string(),
+                source_file: "validators/big.ak".to_string(),
+                source_span: None,
+                parameters: vec![ValidatorParameterContext {
+                    name: "value".to_string(),
+                    r#type: "ByteArray".to_string(),
+                }],
+            })
+            .collect::<Vec<_>>();
+
+        let rendered = render_helper_context(&functions);
+
+        assert!(rendered.contains("helper context truncated"));
+        assert!(rendered.contains("use grep or read_file"));
+        assert!(rendered.contains("- `validators/big.ak`"));
     }
 
     #[test]
