@@ -47,6 +47,8 @@ fn detect_api_family(endpoint: &str, ollama_compat: bool) -> ApiFamily {
 const MAX_RATE_LIMIT_ATTEMPTS: usize = 3;
 const RATE_LIMIT_BASE_DELAY: Duration = Duration::from_secs(5);
 const RATE_LIMIT_MAX_DELAY: Duration = Duration::from_secs(60);
+/// Total time one model turn may spend waiting between retries, shared across
+/// every payload variant and across streaming/non-streaming.
 const RATE_LIMIT_TOTAL_WAIT_BUDGET: Duration = Duration::from_secs(120);
 
 /// What a caller should do next after a failed attempt.
@@ -57,6 +59,9 @@ enum FailureKind {
     /// The payload is fine; the account is sending too fast. Wait, resend the
     /// *same* payload — switching variants here would only thrash the cache.
     RateLimited,
+    /// Transport-level trouble (timeout, reset, dropped stream, 5xx). Waiting
+    /// and resending the same payload is worth trying.
+    Transient,
     /// This payload shape was rejected; the next variant may work.
     NextVariant,
 }
@@ -69,8 +74,12 @@ struct AttemptFailure {
 }
 
 impl AttemptFailure {
-    fn is_fatal(&self) -> bool {
-        self.kind == FailureKind::Fatal
+    fn transient(report: miette::Report) -> Self {
+        Self {
+            report,
+            kind: FailureKind::Transient,
+            retry_after: None,
+        }
     }
 }
 
@@ -81,6 +90,36 @@ impl From<miette::Report> for AttemptFailure {
             kind: FailureKind::NextVariant,
             retry_after: None,
         }
+    }
+}
+
+fn is_retryable(failure: &AttemptFailure) -> bool {
+    matches!(
+        failure.kind,
+        FailureKind::RateLimited | FailureKind::Transient
+    )
+}
+
+fn should_abort_turn(failure: &AttemptFailure) -> bool {
+    matches!(failure.kind, FailureKind::Fatal)
+}
+
+/// Time budget shared by every retry inside one model turn.
+struct RetryBudget {
+    remaining: Duration,
+}
+
+impl RetryBudget {
+    fn new(total: Duration) -> Self {
+        Self { remaining: total }
+    }
+
+    fn take(&mut self, delay: Duration) -> bool {
+        if delay > self.remaining {
+            return false;
+        }
+        self.remaining -= delay;
+        true
     }
 }
 
@@ -96,18 +135,41 @@ fn api_error_message(body: &str) -> String {
         .unwrap_or_else(|| body.trim().to_string())
 }
 
+/// Converts an HTTP-date (IMF-fixdate) into a delay from now.
+fn parse_http_date_delay(value: &str) -> Option<Duration> {
+    let target = chrono::DateTime::parse_from_rfc2822(value)
+        .ok()
+        .map(|date| date.with_timezone(&chrono::Utc))
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(value, "%a, %d %b %Y %H:%M:%S GMT")
+                .ok()
+                .map(|date| date.and_utc())
+        })?;
+
+    let seconds = target
+        .signed_duration_since(chrono::Utc::now())
+        .num_seconds();
+    Some(Duration::from_secs(seconds.max(0) as u64))
+}
+
 /// Reads how long to wait before resending.
 ///
-/// `retry-after` is seconds. OpenRouter sends `x-ratelimit-reset` instead, as
-/// the epoch instant the window reopens — in milliseconds, though seconds and
-/// plain relative values show up across gateways, so all three are accepted.
+/// `retry-after` is either seconds or an HTTP-date. OpenRouter sends
+/// `x-ratelimit-reset` instead, as the epoch instant the window reopens — in
+/// milliseconds, though seconds and plain relative values show up across
+/// gateways, so all three are accepted.
 fn parse_retry_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    if let Some(seconds) = headers
+    if let Some(raw) = headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(str::trim)
     {
-        return Some(Duration::from_secs(seconds).min(RATE_LIMIT_MAX_DELAY));
+        if let Ok(seconds) = raw.parse::<u64>() {
+            return Some(Duration::from_secs(seconds).min(RATE_LIMIT_MAX_DELAY));
+        }
+        if let Some(delay) = parse_http_date_delay(raw) {
+            return Some(delay.min(RATE_LIMIT_MAX_DELAY));
+        }
     }
 
     let reset = headers
@@ -128,7 +190,97 @@ fn parse_retry_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         reset.saturating_mul(1_000)
     };
 
-    (millis > 0).then(|| Duration::from_millis(millis).min(RATE_LIMIT_MAX_DELAY))
+    Some(Duration::from_millis(millis).min(RATE_LIMIT_MAX_DELAY))
+}
+
+fn classify_provider_error_text(
+    message: &str,
+    error_type: &str,
+    retry_after: Option<Duration>,
+) -> AttemptFailure {
+    let lowered = format!("{} {}", message, error_type).to_ascii_lowercase();
+
+    let account_markers = [
+        "credit",
+        "billing",
+        "authentication",
+        "permission",
+        "invalid api key",
+        "insufficient",
+    ];
+    let rate_markers = [
+        "rate limit",
+        "too many requests",
+        "overloaded",
+        "rate_limit",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+    ];
+
+    let kind = if account_markers
+        .iter()
+        .any(|marker| lowered.contains(marker))
+    {
+        FailureKind::Fatal
+    } else if rate_markers.iter().any(|marker| lowered.contains(marker)) {
+        FailureKind::RateLimited
+    } else {
+        FailureKind::NextVariant
+    };
+
+    AttemptFailure {
+        report: miette::miette!("AI provider error: {}", message),
+        kind,
+        retry_after,
+    }
+}
+
+/// Detects provider errors delivered inside a successful (200) response, both
+/// SSE `error` events and JSON bodies with an `/error` pointer.
+fn classify_in_band_error(value: &Value, retry_after: Option<Duration>) -> Option<AttemptFailure> {
+    let error_value = value
+        .get("error")
+        .filter(|error| !error.is_null())
+        .or_else(|| {
+            value
+                .pointer("/response/error")
+                .filter(|error| !error.is_null())
+        });
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    if error_value.is_none() && event_type != "error" && event_type != "response.failed" {
+        return None;
+    }
+
+    let (message, error_type) = match error_value {
+        Some(Value::Object(error)) => (
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("message").and_then(Value::as_str))
+                .unwrap_or("provider reported an error"),
+            error
+                .get("type")
+                .and_then(Value::as_str)
+                .or_else(|| error.get("code").and_then(Value::as_str))
+                .unwrap_or(event_type),
+        ),
+        Some(Value::String(message)) => (message.as_str(), event_type),
+        Some(_) => ("provider reported an error", event_type),
+        None => ("provider reported an error", event_type),
+    };
+
+    Some(classify_provider_error_text(
+        message,
+        error_type,
+        retry_after,
+    ))
 }
 
 fn classify_request_failure(
@@ -139,7 +291,12 @@ fn classify_request_failure(
 ) -> AttemptFailure {
     // 402 is how a gateway reports an empty balance; 401/403 are key and routing
     // problems. No payload variant and no amount of waiting fixes any of them.
-    if matches!(status.as_u16(), 401..=403) {
+    if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED
+            | reqwest::StatusCode::PAYMENT_REQUIRED
+            | reqwest::StatusCode::FORBIDDEN
+    ) {
         return AttemptFailure {
             report: miette::miette!(
                 "AI provider rejected the request ({}): {}",
@@ -152,7 +309,7 @@ fn classify_request_failure(
     }
 
     // 429 and 5xx are timing problems, not payload problems.
-    if status.as_u16() == 429 || status.is_server_error() {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
         return AttemptFailure {
             report: miette::miette!(
                 "AI provider is throttling or unavailable ({}): {}",
@@ -172,65 +329,63 @@ fn classify_request_failure(
 }
 
 /// Returns the delay to use before the next attempt, or `None` when the failure
-/// is not retryable or the total wait budget would be exceeded.
-fn retry_delay_after_failure(
-    failure: &AttemptFailure,
-    retry: usize,
-    waited: Duration,
-) -> Option<Duration> {
-    if failure.kind != FailureKind::RateLimited {
+/// is not retryable.
+fn retry_delay_after_failure(failure: &AttemptFailure, retry: usize) -> Option<Duration> {
+    if !is_retryable(failure) {
         return None;
     }
 
-    let delay = failure
-        .retry_after
-        .unwrap_or_else(|| RATE_LIMIT_BASE_DELAY * 2u32.pow(retry.min(31) as u32))
-        .min(RATE_LIMIT_MAX_DELAY);
-
-    (waited.saturating_add(delay) <= RATE_LIMIT_TOTAL_WAIT_BUDGET).then_some(delay)
+    Some(
+        failure
+            .retry_after
+            .unwrap_or_else(|| RATE_LIMIT_BASE_DELAY * 2u32.pow(retry.min(31) as u32))
+            .min(RATE_LIMIT_MAX_DELAY),
+    )
 }
 
-/// Runs one payload variant, waiting out rate limits instead of falling through
-/// to a different variant or failing the skill.
+/// Runs one payload variant, waiting out retryable failures instead of falling
+/// through to a different variant or failing the skill.
 async fn attempt_with_backoff<'a, F, Fut>(
     ai_logs: bool,
     label: &str,
     attempt_idx: usize,
-    mut run: F,
+    budget: &mut RetryBudget,
+    run: F,
 ) -> std::result::Result<(String, TokenUsage), AttemptFailure>
 where
-    F: FnMut() -> Fut,
+    F: Fn() -> Fut,
     Fut: std::future::Future<Output = std::result::Result<(String, TokenUsage), AttemptFailure>>
         + 'a,
 {
-    let mut waited = Duration::ZERO;
     let mut last = match run().await {
         Ok(value) => return Ok(value),
         Err(failure) => failure,
     };
 
     for retry in 0..MAX_RATE_LIMIT_ATTEMPTS.saturating_sub(1) {
-        // Time matters: stop retrying once the total wait would exceed the
-        // budget instead of sleeping for minutes on a saturated account.
-        let Some(delay) = retry_delay_after_failure(&last, retry, waited) else {
+        // Non-retryable failures return quietly; only a retryable failure that
+        // cannot fit in the remaining budget should report budget exhaustion.
+        let Some(delay) = retry_delay_after_failure(&last, retry) else {
+            return Err(last);
+        };
+
+        if !budget.take(delay) {
             log_agent_progress(
                 ai_logs,
                 format!(
-                    "⏳ {} attempt {} stopped retrying (budget {}s exhausted); giving up",
+                    "⏳ {} attempt {} stopped retrying (turn budget {}s exhausted); giving up",
                     label,
                     attempt_idx + 1,
                     RATE_LIMIT_TOTAL_WAIT_BUDGET.as_secs()
                 ),
             );
             return Err(last);
-        };
-
-        waited = waited.saturating_add(delay);
+        }
 
         log_agent_progress(
             ai_logs,
             format!(
-                "⏳ {} attempt {} rate limited; waiting {}s before retry {}/{}",
+                "⏳ {} attempt {} rate limited or transient; waiting {}s before retry {}/{}",
                 label,
                 attempt_idx + 1,
                 delay.as_secs(),
@@ -247,6 +402,68 @@ where
     }
 
     Err(last)
+}
+
+async fn send_request(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: &str,
+    payload: &Value,
+) -> std::result::Result<reqwest::Response, AttemptFailure> {
+    client
+        .post(endpoint)
+        .bearer_auth(api_key)
+        .json(payload)
+        .send()
+        .await
+        .into_diagnostic()
+        .map_err(AttemptFailure::transient)
+}
+
+/// Checks the HTTP status and preserves why the gateway refused, so the caller
+/// can decide whether waiting or another payload can help.
+async fn ensure_success(
+    response: reqwest::Response,
+    label: &str,
+) -> std::result::Result<(reqwest::Response, Option<Duration>), AttemptFailure> {
+    let status = response.status();
+    let retry_after = parse_retry_delay(response.headers());
+
+    if status.is_success() {
+        return Ok((response, retry_after));
+    }
+
+    let body = response
+        .text()
+        .await
+        .into_diagnostic()
+        .map_err(AttemptFailure::transient)?;
+    Err(classify_request_failure(label, status, &body, retry_after))
+}
+
+async fn run_attempt(
+    api_family: ApiFamily,
+    stream: bool,
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: &str,
+    payload: &Value,
+    ai_logs: bool,
+) -> std::result::Result<(String, TokenUsage), AttemptFailure> {
+    match (api_family, stream) {
+        (ApiFamily::ChatCompletions, true) => {
+            stream_chat_attempt(client, endpoint, api_key, payload, ai_logs).await
+        }
+        (ApiFamily::Responses, true) => {
+            stream_responses_attempt(client, endpoint, api_key, payload, ai_logs).await
+        }
+        (ApiFamily::ChatCompletions, false) => {
+            non_stream_chat_attempt(client, endpoint, api_key, payload, ai_logs).await
+        }
+        (ApiFamily::Responses, false) => {
+            non_stream_responses_attempt(client, endpoint, api_key, payload, ai_logs).await
+        }
+    }
 }
 
 fn build_chat_payload_variants(
@@ -701,33 +918,22 @@ async fn stream_chat_attempt(
     payload: &Value,
     ai_logs: bool,
 ) -> std::result::Result<(String, TokenUsage), AttemptFailure> {
-    let mut response = client
-        .post(endpoint)
-        .bearer_auth(api_key)
-        .json(payload)
-        .send()
-        .await
-        .into_diagnostic()?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let retry_after = parse_retry_delay(response.headers());
-        let body = response.text().await.into_diagnostic()?;
-        return Err(classify_request_failure(
-            "Streaming request",
-            status,
-            &body,
-            retry_after,
-        ));
-    }
+    let response = send_request(client, endpoint, api_key, payload).await?;
+    let (mut response, retry_after_hint) = ensure_success(response, "Streaming request").await?;
 
     let mut pending = String::new();
     let mut model_output = String::new();
     let mut reasoning_stream_state = ReasoningStreamState::default();
     let mut content_stream_state = ContentStreamState::default();
     let mut usage = TokenUsage::default();
+    let mut stream_error: Option<AttemptFailure> = None;
 
-    while let Some(chunk) = response.chunk().await.into_diagnostic()? {
+    'stream: while let Some(chunk) = response
+        .chunk()
+        .await
+        .into_diagnostic()
+        .map_err(AttemptFailure::transient)?
+    {
         pending.push_str(&String::from_utf8_lossy(&chunk));
 
         while let Some(newline_index) = pending.find('\n') {
@@ -748,6 +954,11 @@ async fn stream_chat_attempt(
                 Ok(parsed) => parsed,
                 Err(_) => continue,
             };
+
+            if let Some(failure) = classify_in_band_error(&event, retry_after_hint) {
+                stream_error = Some(failure);
+                break 'stream;
+            }
 
             if let Some(chunk_usage) = extract_openai_chat_usage(&event) {
                 usage = chunk_usage;
@@ -772,8 +983,14 @@ async fn stream_chat_attempt(
     finalize_content_stdout(ai_logs, &mut content_stream_state);
     finalize_reasoning_stdout(ai_logs, &mut reasoning_stream_state);
 
+    if let Some(failure) = stream_error {
+        return Err(failure);
+    }
+
     if model_output.is_empty() {
-        return Err(miette::miette!("Streaming response did not include content deltas").into());
+        return Err(AttemptFailure::transient(miette::miette!(
+            "Streaming response did not include content deltas"
+        )));
     }
 
     Ok((model_output, usage))
@@ -786,33 +1003,22 @@ async fn stream_responses_attempt(
     payload: &Value,
     ai_logs: bool,
 ) -> std::result::Result<(String, TokenUsage), AttemptFailure> {
-    let mut response = client
-        .post(endpoint)
-        .bearer_auth(api_key)
-        .json(payload)
-        .send()
-        .await
-        .into_diagnostic()?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let retry_after = parse_retry_delay(response.headers());
-        let body = response.text().await.into_diagnostic()?;
-        return Err(classify_request_failure(
-            "Streaming request",
-            status,
-            &body,
-            retry_after,
-        ));
-    }
+    let response = send_request(client, endpoint, api_key, payload).await?;
+    let (mut response, retry_after_hint) = ensure_success(response, "Streaming request").await?;
 
     let mut pending = String::new();
     let mut model_output = String::new();
     let mut reasoning_stream_state = ReasoningStreamState::default();
     let mut content_stream_state = ContentStreamState::default();
     let mut usage = TokenUsage::default();
+    let mut stream_error: Option<AttemptFailure> = None;
 
-    while let Some(chunk) = response.chunk().await.into_diagnostic()? {
+    'stream: while let Some(chunk) = response
+        .chunk()
+        .await
+        .into_diagnostic()
+        .map_err(AttemptFailure::transient)?
+    {
         pending.push_str(&String::from_utf8_lossy(&chunk));
 
         while let Some(newline_index) = pending.find('\n') {
@@ -833,6 +1039,11 @@ async fn stream_responses_attempt(
                 Ok(parsed) => parsed,
                 Err(_) => continue,
             };
+
+            if let Some(failure) = classify_in_band_error(&event, retry_after_hint) {
+                stream_error = Some(failure);
+                break 'stream;
+            }
 
             if let Some(event_usage) = extract_openai_responses_event_usage(&event) {
                 usage = event_usage;
@@ -862,10 +1073,14 @@ async fn stream_responses_attempt(
     finalize_content_stdout(ai_logs, &mut content_stream_state);
     finalize_reasoning_stdout(ai_logs, &mut reasoning_stream_state);
 
+    if let Some(failure) = stream_error {
+        return Err(failure);
+    }
+
     if model_output.is_empty() {
-        return Err(
-            miette::miette!("Streaming response did not include output text deltas").into(),
-        );
+        return Err(AttemptFailure::transient(miette::miette!(
+            "Streaming response did not include output text deltas"
+        )));
     }
 
     Ok((model_output, usage))
@@ -878,29 +1093,17 @@ async fn non_stream_chat_attempt(
     payload: &Value,
     ai_logs: bool,
 ) -> std::result::Result<(String, TokenUsage), AttemptFailure> {
-    let response = client
-        .post(endpoint)
-        .bearer_auth(api_key)
-        .json(payload)
-        .send()
+    let response = send_request(client, endpoint, api_key, payload).await?;
+    let (response, retry_after_hint) = ensure_success(response, "Non-stream request").await?;
+    let response_json = response
+        .json::<Value>()
         .await
-        .into_diagnostic()?;
+        .into_diagnostic()
+        .map_err(AttemptFailure::transient)?;
 
-    // `error_for_status` throws the body away, and the body is where the gateway
-    // explains *why* it refused — which decides whether waiting can help.
-    let status = response.status();
-    if !status.is_success() {
-        let retry_after = parse_retry_delay(response.headers());
-        let body = response.text().await.into_diagnostic()?;
-        return Err(classify_request_failure(
-            "Non-stream request",
-            status,
-            &body,
-            retry_after,
-        ));
+    if let Some(failure) = classify_in_band_error(&response_json, retry_after_hint) {
+        return Err(failure);
     }
-
-    let response_json = response.json::<Value>().await.into_diagnostic()?;
 
     let content = response_json
         .pointer("/choices/0/message/content")
@@ -938,29 +1141,17 @@ async fn non_stream_responses_attempt(
     payload: &Value,
     ai_logs: bool,
 ) -> std::result::Result<(String, TokenUsage), AttemptFailure> {
-    let response = client
-        .post(endpoint)
-        .bearer_auth(api_key)
-        .json(payload)
-        .send()
+    let response = send_request(client, endpoint, api_key, payload).await?;
+    let (response, retry_after_hint) = ensure_success(response, "Non-stream request").await?;
+    let response_json = response
+        .json::<Value>()
         .await
-        .into_diagnostic()?;
+        .into_diagnostic()
+        .map_err(AttemptFailure::transient)?;
 
-    // `error_for_status` throws the body away, and the body is where the gateway
-    // explains *why* it refused — which decides whether waiting can help.
-    let status = response.status();
-    if !status.is_success() {
-        let retry_after = parse_retry_delay(response.headers());
-        let body = response.text().await.into_diagnostic()?;
-        return Err(classify_request_failure(
-            "Non-stream request",
-            status,
-            &body,
-            retry_after,
-        ));
+    if let Some(failure) = classify_in_band_error(&response_json, retry_after_hint) {
+        return Err(failure);
     }
-
-    let response_json = response.json::<Value>().await.into_diagnostic()?;
 
     let content = extract_responses_output_text(&response_json)
         .ok_or_else(|| miette::miette!("AI provider returned an unexpected response payload"))?;
@@ -1055,6 +1246,7 @@ impl AnalysisProvider for OpenAiProvider {
                 block_on_runtime_aware(async {
                     let client = reqwest::Client::new();
                     let reasoning_effort = self.reasoning_effort.as_deref();
+                    let mut budget = RetryBudget::new(RATE_LIMIT_TOTAL_WAIT_BUDGET);
 
                     if self.ai_logs {
                         let mut last_stream_error: Option<String> = None;
@@ -1079,35 +1271,27 @@ impl AnalysisProvider for OpenAiProvider {
                                 self.ai_logs,
                                 "Streaming",
                                 attempt_idx,
-                                || async {
-                                    match api_family {
-                                        ApiFamily::ChatCompletions => {
-                                            stream_chat_attempt(
-                                                &client,
-                                                &self.endpoint,
-                                                &self.api_key,
-                                                stream_payload,
-                                                self.ai_logs,
-                                            )
-                                            .await
-                                        }
-                                        ApiFamily::Responses => {
-                                            stream_responses_attempt(
-                                                &client,
-                                                &self.endpoint,
-                                                &self.api_key,
-                                                stream_payload,
-                                                self.ai_logs,
-                                            )
-                                            .await
-                                        }
-                                    }
+                                &mut budget,
+                                || {
+                                    run_attempt(
+                                        api_family,
+                                        true,
+                                        &client,
+                                        &self.endpoint,
+                                        &self.api_key,
+                                        stream_payload,
+                                        self.ai_logs,
+                                    )
                                 },
                             )
                             .await
                             {
                                 Ok(content) => return Ok(content),
-                                Err(failure) if failure.is_fatal() => return Err(failure.report),
+                                // Account-level failures cannot be fixed by another
+                                // payload variant or by falling back to non-streaming.
+                                Err(failure) if should_abort_turn(&failure) => {
+                                    return Err(failure.report);
+                                }
                                 Err(failure) => {
                                     last_stream_error = Some(failure.report.to_string());
                                     log_agent_progress(
@@ -1156,35 +1340,27 @@ impl AnalysisProvider for OpenAiProvider {
                             self.ai_logs,
                             "Non-stream",
                             attempt_idx,
-                            || async {
-                                match api_family {
-                                    ApiFamily::ChatCompletions => {
-                                        non_stream_chat_attempt(
-                                            &client,
-                                            &self.endpoint,
-                                            &self.api_key,
-                                            payload,
-                                            self.ai_logs,
-                                        )
-                                        .await
-                                    }
-                                    ApiFamily::Responses => {
-                                        non_stream_responses_attempt(
-                                            &client,
-                                            &self.endpoint,
-                                            &self.api_key,
-                                            payload,
-                                            self.ai_logs,
-                                        )
-                                        .await
-                                    }
-                                }
+                            &mut budget,
+                            || {
+                                run_attempt(
+                                    api_family,
+                                    false,
+                                    &client,
+                                    &self.endpoint,
+                                    &self.api_key,
+                                    payload,
+                                    self.ai_logs,
+                                )
                             },
                         )
                         .await
                         {
                             Ok(content) => return Ok(content),
-                            Err(failure) if failure.is_fatal() => return Err(failure.report),
+                            // Account-level failures cannot be fixed by another
+                            // payload variant or by a non-stream retry.
+                            Err(failure) if should_abort_turn(&failure) => {
+                                return Err(failure.report);
+                            }
                             Err(failure) => {
                                 last_non_stream_error = Some(failure.report.to_string());
                                 log_agent_progress(
@@ -1248,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_already_in_the_past_yields_no_delay() {
+    fn a_reset_already_in_the_past_retries_immediately() {
         let elapsed_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock after epoch")
@@ -1257,7 +1433,31 @@ mod tests {
 
         assert_eq!(
             parse_retry_delay(&headers_with("x-ratelimit-reset", elapsed_ms.to_string())),
-            None
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn retry_after_http_date_is_supported() {
+        let future = chrono::Utc::now() + chrono::Duration::seconds(30);
+        let value = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+
+        let delay = parse_retry_delay(&headers_with("retry-after", value)).expect("a delay");
+        assert!(
+            delay <= Duration::from_secs(30) && delay >= Duration::from_secs(25),
+            "unexpected delay: {:?}",
+            delay
+        );
+    }
+
+    #[test]
+    fn retry_after_in_the_past_retries_immediately() {
+        let past = chrono::Utc::now() - chrono::Duration::seconds(30);
+        let value = past.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+
+        assert_eq!(
+            parse_retry_delay(&headers_with("retry-after", value)),
+            Some(Duration::ZERO)
         );
     }
 
@@ -1272,7 +1472,7 @@ mod tests {
 
         assert_eq!(failure.kind, FailureKind::RateLimited);
         assert_eq!(failure.retry_after, Some(Duration::from_secs(9)));
-        assert!(!failure.is_fatal());
+        assert!(!should_abort_turn(&failure));
         assert!(failure.report.to_string().contains("new-account-rpm"));
     }
 
@@ -1285,7 +1485,7 @@ mod tests {
             None,
         );
 
-        assert!(failure.is_fatal());
+        assert!(should_abort_turn(&failure));
         assert!(failure.report.to_string().contains("Insufficient credits"));
     }
 
@@ -1304,8 +1504,9 @@ mod tests {
     #[tokio::test]
     async fn retries_a_rate_limited_request_without_switching_variants() {
         let attempts = AtomicUsize::new(0);
+        let mut budget = RetryBudget::new(Duration::from_secs(120));
 
-        let result = attempt_with_backoff(false, "Test", 0, || {
+        let result = attempt_with_backoff(false, "Test", 0, &mut budget, || {
             let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
             async move {
                 if attempt < 3 {
@@ -1329,8 +1530,9 @@ mod tests {
     #[tokio::test]
     async fn fatal_failures_are_not_retried() {
         let attempts = AtomicUsize::new(0);
+        let mut budget = RetryBudget::new(Duration::from_secs(120));
 
-        let error = attempt_with_backoff(false, "Test", 0, || {
+        let error = attempt_with_backoff(false, "Test", 0, &mut budget, || {
             attempts.fetch_add(1, Ordering::SeqCst);
             async {
                 Err(AttemptFailure {
@@ -1348,23 +1550,128 @@ mod tests {
     }
 
     #[test]
-    fn retry_budget_rejects_a_wait_that_exceeds_it() {
+    fn retry_budget_is_shared_across_calls() {
+        let mut budget = RetryBudget::new(Duration::from_secs(10));
+
+        assert!(budget.take(Duration::from_secs(6)));
+        assert!(!budget.take(Duration::from_secs(6)));
+        assert!(budget.take(Duration::from_secs(4)));
+    }
+
+    #[test]
+    fn retry_delay_is_capped_per_attempt() {
         let failure = AttemptFailure {
             report: miette::miette!("429 Too Many Requests"),
             kind: FailureKind::RateLimited,
             retry_after: Some(Duration::from_secs(121)),
         };
 
-        // The per-attempt delay is capped at 60s...
         assert_eq!(
-            retry_delay_after_failure(&failure, 0, Duration::ZERO),
+            retry_delay_after_failure(&failure, 0),
             Some(Duration::from_secs(60))
         );
-        // ...and a second wait would exceed the 120s total budget.
-        assert_eq!(
-            retry_delay_after_failure(&failure, 1, Duration::from_secs(61)),
-            None
-        );
+    }
+
+    #[test]
+    fn transient_failures_are_retryable() {
+        let failure = AttemptFailure::transient(miette::miette!("connection reset"));
+
+        assert_eq!(failure.kind, FailureKind::Transient);
+        assert!(retry_delay_after_failure(&failure, 0).is_some());
+    }
+
+    #[test]
+    fn next_variant_failures_are_not_retryable() {
+        let failure = AttemptFailure {
+            report: miette::miette!("unsupported parameter"),
+            kind: FailureKind::NextVariant,
+            retry_after: None,
+        };
+
+        assert!(retry_delay_after_failure(&failure, 0).is_none());
+    }
+
+    #[test]
+    fn fatal_failures_abort_the_turn() {
+        let fatal = AttemptFailure {
+            report: miette::miette!("no credits"),
+            kind: FailureKind::Fatal,
+            retry_after: None,
+        };
+        let rate_limited = AttemptFailure {
+            report: miette::miette!("429"),
+            kind: FailureKind::RateLimited,
+            retry_after: None,
+        };
+        let transient = AttemptFailure::transient(miette::miette!("timeout"));
+        let next_variant = AttemptFailure {
+            report: miette::miette!("bad payload"),
+            kind: FailureKind::NextVariant,
+            retry_after: None,
+        };
+
+        assert!(should_abort_turn(&fatal));
+        assert!(!should_abort_turn(&rate_limited));
+        assert!(!should_abort_turn(&transient));
+        assert!(!should_abort_turn(&next_variant));
+    }
+
+    #[test]
+    fn in_band_rate_limit_is_retryable() {
+        let event = json!({
+            "error": {
+                "message": "Rate limit exceeded",
+                "type": "rate_limit_error"
+            }
+        });
+
+        let failure = classify_in_band_error(&event, Some(Duration::from_secs(7)))
+            .expect("should detect in-band error");
+
+        assert_eq!(failure.kind, FailureKind::RateLimited);
+        assert_eq!(failure.retry_after, Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn in_band_credit_exhaustion_is_fatal() {
+        let event = json!({
+            "error": {
+                "message": "Insufficient credits"
+            }
+        });
+
+        let failure = classify_in_band_error(&event, None).expect("should detect in-band error");
+
+        assert!(should_abort_turn(&failure));
+    }
+
+    #[test]
+    fn responses_failed_event_is_detected() {
+        let event = json!({
+            "type": "response.failed",
+            "response": {
+                "error": {
+                    "message": "upstream overloaded",
+                    "code": "overloaded_error"
+                }
+            }
+        });
+
+        let failure = classify_in_band_error(&event, None).expect("should detect failure event");
+
+        assert_eq!(failure.kind, FailureKind::RateLimited);
+    }
+
+    #[test]
+    fn ordinary_stream_events_are_not_errors() {
+        let event = json!({"choices": [{"delta": {"content": "{}"}}]});
+        assert!(classify_in_band_error(&event, None).is_none());
+    }
+
+    #[test]
+    fn null_error_fields_are_ignored() {
+        let event = json!({"choices": [], "error": null});
+        assert!(classify_in_band_error(&event, None).is_none());
     }
 
     #[test]
