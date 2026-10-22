@@ -158,6 +158,8 @@ The body is passed to the model as authoritative guidance for this skill.
 
 If `--skills-dir` is left at its default (`skills/vulnerabilities`) and the directory does not exist on disk, `preflight` falls back to three embedded seed skills.
 
+Skills run in severity order (`critical`, `high`, `medium`, `low`), then by id. A broad low-severity optimization therefore cannot consume the budget before a critical check.
+
 ### Built-in seed skills
 
 | ID | Severity | What it detects |
