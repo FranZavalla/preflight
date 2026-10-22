@@ -757,7 +757,7 @@ fn build_permission_prompt_spec(
 fn build_report(
     state: &AnalysisStateJson,
     skills: &[VulnerabilitySkill],
-    incomplete: bool,
+    aborted: bool,
 ) -> VulnerabilityReportSpec {
     let findings = state
         .iterations
@@ -768,7 +768,7 @@ fn build_report(
     VulnerabilityReportSpec {
         title: "Vulnerability Report".to_string(),
         generated_at: chrono::Utc::now().to_rfc3339(),
-        coverage_markdown: render_coverage_markdown(state, skills, findings.len(), incomplete),
+        coverage_markdown: render_coverage_markdown(state, skills, findings.len(), aborted),
         findings,
     }
 }
@@ -781,7 +781,7 @@ fn render_coverage_markdown(
     state: &AnalysisStateJson,
     skills: &[VulnerabilitySkill],
     findings_count: usize,
-    incomplete: bool,
+    aborted: bool,
 ) -> String {
     let mut completed = 0usize;
     let mut failed = 0usize;
@@ -839,9 +839,22 @@ fn render_coverage_markdown(
         .filter(|iteration| !skills.iter().any(|skill| skill.id == iteration.skill_id))
         .count();
 
+    let incomplete = aborted || failed > 0 || not_run > 0;
     let mut coverage = String::new();
     if incomplete {
-        coverage.push_str("- Status: INCOMPLETE — the skill loop stopped early.\n");
+        let reason = if aborted {
+            "the skill loop stopped early".to_string()
+        } else {
+            let mut parts = Vec::new();
+            if failed > 0 {
+                parts.push(format!("{} skill(s) failed", failed));
+            }
+            if not_run > 0 {
+                parts.push(format!("{} skill(s) not run", not_run));
+            }
+            parts.join(", ")
+        };
+        coverage.push_str(&format!("- Status: INCOMPLETE — {}.\n", reason));
     }
     coverage.push_str(&format!(
         "- Skills: {} completed, {} failed, {} unsupported, {} scaffolded, {} not run ({} total)\n\
@@ -2069,8 +2082,58 @@ body
         let report = build_report(&state, &skills, true);
 
         assert!(report.coverage_markdown.contains("Status: INCOMPLETE"));
+        assert!(report.coverage_markdown.contains("stopped early"));
         assert!(report.coverage_markdown.contains("1 failed"));
         assert!(report.coverage_markdown.contains("1 not run"));
+    }
+
+    #[test]
+    fn report_coverage_marks_failed_skills_incomplete_without_abort() {
+        let skills = vec![skill_named("a"), skill_named("b")];
+        let mut state = empty_state();
+        state.iterations = vec![
+            iteration_with_fingerprint("a", "failed", "sha256:a", Some("test"), Some(10)),
+            iteration_with_fingerprint("b", "completed", "sha256:b", Some("test"), Some(10)),
+        ];
+
+        let report = build_report(&state, &skills, false);
+
+        assert!(report.coverage_markdown.contains("Status: INCOMPLETE"));
+        assert!(report.coverage_markdown.contains("1 skill(s) failed"));
+        assert!(!report.coverage_markdown.contains("stopped early"));
+    }
+
+    #[test]
+    fn report_coverage_marks_not_run_skills_incomplete_without_abort() {
+        let skills = vec![skill_named("a"), skill_named("b")];
+        let mut state = empty_state();
+        state.iterations = vec![iteration_with_fingerprint(
+            "a",
+            "completed",
+            "sha256:a",
+            Some("test"),
+            Some(10),
+        )];
+
+        let report = build_report(&state, &skills, false);
+
+        assert!(report.coverage_markdown.contains("Status: INCOMPLETE"));
+        assert!(report.coverage_markdown.contains("1 skill(s) not run"));
+        assert!(!report.coverage_markdown.contains("stopped early"));
+    }
+
+    #[test]
+    fn report_coverage_omits_banner_when_complete() {
+        let skills = vec![skill_named("a"), skill_named("b")];
+        let mut state = empty_state();
+        state.iterations = vec![
+            iteration_with_fingerprint("a", "completed", "sha256:a", Some("test"), Some(10)),
+            iteration_with_fingerprint("b", "completed", "sha256:b", Some("test"), Some(10)),
+        ];
+
+        let report = build_report(&state, &skills, false);
+
+        assert!(!report.coverage_markdown.contains("Status: INCOMPLETE"));
     }
 
     #[test]
