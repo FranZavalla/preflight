@@ -929,13 +929,22 @@ fn truncate_summary_text(summary: &str) -> String {
 
 fn truncate_error_text(error: &str) -> String {
     const MAX_CHARS: usize = 500;
+    const HEAD_CHARS: usize = 300;
+    const TAIL_CHARS: usize = 150;
+
     let error = error.trim().replace('\n', " ");
-    if error.chars().count() <= MAX_CHARS {
+    let total = error.chars().count();
+    if total <= MAX_CHARS {
         return error;
     }
 
-    let truncated = error.chars().take(MAX_CHARS).collect::<String>();
-    format!("{}…", truncated)
+    // Keep both ends: miette context wrappers put the request at the head and
+    // the actionable cause (for example "Stopping: ...") at the tail.
+    let head = error.chars().take(HEAD_CHARS).collect::<String>();
+    let tail = error.chars().skip(total - TAIL_CHARS).collect::<String>();
+    let omitted = total.saturating_sub(HEAD_CHARS + TAIL_CHARS);
+
+    format!("{} … <omitted {} chars> … {}", head, omitted, tail)
 }
 
 fn load_skills(skills_dir: &Path, skills_dir_arg: &str) -> Result<Vec<VulnerabilitySkill>> {
@@ -2205,5 +2214,33 @@ body
         assert_eq!(format_duration_ms(500), "500ms");
         assert_eq!(format_duration_ms(1_500), "1.5s");
         assert_eq!(format_duration_ms(65_000), "1m 5s");
+    }
+
+    #[test]
+    fn truncate_error_text_keeps_both_ends() {
+        let error = format!("{}{}{}", "start ".repeat(100), "x".repeat(1000), " cause");
+        let truncated = truncate_error_text(&error);
+
+        assert!(truncated.starts_with("start "));
+        assert!(truncated.contains("omitted"));
+        assert!(truncated.ends_with("cause"));
+        assert!(truncated.len() < error.len());
+    }
+
+    #[test]
+    fn truncate_error_text_handles_multibyte_input() {
+        let error = format!("{}{}", "é".repeat(1000), " done");
+        let truncated = truncate_error_text(&error);
+
+        assert!(truncated.contains("omitted"));
+        assert!(truncated.ends_with(" done"));
+    }
+
+    #[test]
+    fn truncate_error_text_leaves_short_errors_unchanged() {
+        assert_eq!(
+            truncate_error_text("429 Too Many Requests"),
+            "429 Too Many Requests"
+        );
     }
 }
