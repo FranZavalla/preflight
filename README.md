@@ -10,7 +10,7 @@
 2. **AST generation** — parses each source file with `aiken-lang`, builds a per-validator context (handlers, parameters, source spans), and caches the snapshot to `.tx3/audit/aiken-ast.json`.
 3. **Skill loop** — for each vulnerability skill (markdown files with YAML frontmatter), invokes the configured provider with the skill prompt and AST context. The provider returns findings (or asks for additional file reads via a tool-call loop).
 4. **Persistence** — after every skill iteration, the analysis state is written to `.tx3/audit/state.json`. Pass `--resume` to skip completed skills and retry failed or missing ones after an interruption.
-5. **Report** — once all skills finish, a markdown report is rendered to `.tx3/audit/vulnerabilities.md`.
+5. **Report** — a markdown report is rendered to `.tx3/audit/vulnerabilities.md`, including per-skill coverage, provider/model, timing, and any failed or skipped skills.
 
 ## Installation
 

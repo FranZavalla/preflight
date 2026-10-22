@@ -42,6 +42,7 @@ impl AnalysisProvider for ScaffoldProvider {
             skill_fingerprint: None,
             provider: None,
             duration_ms: None,
+            analysis_summary: None,
             token_usage: Default::default(),
         })
     }

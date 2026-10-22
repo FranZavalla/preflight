@@ -38,6 +38,10 @@ pub struct SkillIterationResult {
     /// Wall-clock time spent on this skill, including tool calls and retries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// The model's own explanation of what it checked and why it concluded
+    /// what it did. Persisted so empty results are auditable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_summary: Option<String>,
     #[serde(default, skip_serializing_if = "TokenUsage::is_empty")]
     pub token_usage: TokenUsage,
 }
@@ -203,6 +207,7 @@ fn default_read_scope() -> String {
 pub struct VulnerabilityReportSpec {
     pub title: String,
     pub generated_at: String,
+    pub coverage_markdown: String,
     pub findings: Vec<VulnerabilityFinding>,
 }
 
@@ -317,6 +322,7 @@ mod tests {
             skill_fingerprint: None,
             provider: None,
             duration_ms: None,
+            analysis_summary: None,
             token_usage: TokenUsage::default(),
         };
         let json_iter = serde_json::to_string(&iter).expect("serialize");
@@ -335,6 +341,7 @@ mod tests {
             skill_fingerprint: None,
             provider: None,
             duration_ms: None,
+            analysis_summary: None,
             token_usage: TokenUsage {
                 input_tokens: 123,
                 output_tokens: 45,

@@ -1228,6 +1228,12 @@ pub(super) fn iteration_from_parsed(
             text: text.to_string(),
         });
 
+    let analysis_summary = parsed
+        .get("analysis_summary")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string);
+
     SkillIterationResult {
         skill_id: skill.id.clone(),
         status,
@@ -1236,6 +1242,7 @@ pub(super) fn iteration_from_parsed(
         skill_fingerprint: None,
         provider: None,
         duration_ms: None,
+        analysis_summary,
         token_usage,
     }
 }
@@ -1772,5 +1779,21 @@ mod tests {
 
         assert_eq!(sent, MAX_MALFORMED_REPLIES + 1, "should stop after the cap");
         assert!(error.to_string().contains("unparseable replies in a row"));
+    }
+
+    #[test]
+    fn iteration_from_parsed_reads_analysis_summary() {
+        let parsed = json!({
+            "status": "completed",
+            "findings": [],
+            "analysis_summary": "checked the spend path"
+        });
+
+        let iteration = iteration_from_parsed(&dummy_skill(), parsed, TokenUsage::default());
+
+        assert_eq!(
+            iteration.analysis_summary.as_deref(),
+            Some("checked the spend path")
+        );
     }
 }
