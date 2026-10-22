@@ -330,6 +330,7 @@ fn run_skill_loop(
             // the time skill 9 comes around.
             Err(error) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
+                let error_text = truncate_error_text(&error.to_string());
 
                 log_audit_progress(
                     context.ai_logs,
@@ -352,6 +353,7 @@ fn run_skill_loop(
                     provider: Some(provider_spec.clone()),
                     duration_ms: Some(started.elapsed().as_millis() as u64),
                     analysis_summary: None,
+                    error: Some(error_text),
                     token_usage: crate::model::TokenUsage::default(),
                 };
 
@@ -797,13 +799,14 @@ fn render_coverage_markdown(
             .rev()
             .find(|iteration| iteration.skill_id == skill.id);
 
-        let (status, findings, summary) = match iteration {
+        let (status, findings, summary, error) = match iteration {
             Some(iteration) => (
                 iteration.status.as_str(),
                 iteration.findings.len(),
                 iteration.analysis_summary.as_deref(),
+                iteration.error.as_deref(),
             ),
-            None => ("not run", 0, None),
+            None => ("not run", 0, None, None),
         };
 
         match status {
@@ -823,13 +826,16 @@ fn render_coverage_markdown(
             .and_then(|iteration| iteration.duration_ms)
             .map(format_duration_ms)
             .unwrap_or_else(|| "time unknown".to_string());
+        let error = error
+            .map(|value| format!(" — error: {}", truncate_error_text(value)))
+            .unwrap_or_default();
         let summary = summary
             .map(|value| format!(" — summary: {}", truncate_summary_text(value)))
             .unwrap_or_default();
 
         skill_lines.push(format!(
-            "- `{}` — {} — {} finding(s) — {} — {}{}",
-            skill.id, status, findings, provider, duration, summary
+            "- `{}` — {} — {} finding(s) — {} — {}{}{}",
+            skill.id, status, findings, provider, duration, error, summary
         ));
     }
 
@@ -918,6 +924,17 @@ fn truncate_summary_text(summary: &str) -> String {
     }
 
     let truncated = summary.chars().take(MAX_CHARS).collect::<String>();
+    format!("{}…", truncated)
+}
+
+fn truncate_error_text(error: &str) -> String {
+    const MAX_CHARS: usize = 500;
+    let error = error.trim().replace('\n', " ");
+    if error.chars().count() <= MAX_CHARS {
+        return error;
+    }
+
+    let truncated = error.chars().take(MAX_CHARS).collect::<String>();
     format!("{}…", truncated)
 }
 
@@ -1364,6 +1381,7 @@ body
                     provider: None,
                     duration_ms: None,
                     analysis_summary: None,
+                    error: None,
                     token_usage: crate::model::TokenUsage::default(),
                 })
             }
@@ -1402,6 +1420,13 @@ body
         assert_eq!(state.iterations.len(), 3);
         assert_eq!(state.iterations[0].status, "completed");
         assert_eq!(state.iterations[1].status, "failed");
+        assert!(
+            state.iterations[1]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("429")
+        );
         assert_eq!(state.iterations[2].status, "completed");
     }
 
@@ -1496,6 +1521,7 @@ body
             }),
             duration_ms,
             analysis_summary: None,
+            error: None,
             token_usage: crate::model::TokenUsage::default(),
         }
     }
@@ -1510,6 +1536,7 @@ body
             provider: None,
             duration_ms: None,
             analysis_summary: None,
+            error: None,
             token_usage: crate::model::TokenUsage::default(),
         }
     }
@@ -2065,6 +2092,25 @@ body
         let markdown = render_report_markdown(&report);
         assert!(markdown.contains("## Coverage"));
         assert!(markdown.contains("1 not run"));
+    }
+
+    #[test]
+    fn report_coverage_includes_failure_reason() {
+        let skills = vec![skill_named("a")];
+        let mut failed =
+            iteration_with_fingerprint("a", "failed", "sha256:a", Some("test"), Some(10));
+        failed.error = Some("429 Too Many Requests".to_string());
+
+        let mut state = empty_state();
+        state.iterations = vec![failed];
+
+        let report = build_report(&state, &skills, false);
+
+        assert!(
+            report
+                .coverage_markdown
+                .contains("error: 429 Too Many Requests")
+        );
     }
 
     #[test]

@@ -1316,6 +1316,7 @@ pub(super) fn iteration_from_parsed(
         provider: None,
         duration_ms: None,
         analysis_summary,
+        error: None,
         token_usage,
     }
 }

@@ -42,6 +42,9 @@ pub struct SkillIterationResult {
     /// what it did. Persisted so empty results are auditable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analysis_summary: Option<String>,
+    /// Reason the skill failed, when status is "failed".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     #[serde(default, skip_serializing_if = "TokenUsage::is_empty")]
     pub token_usage: TokenUsage,
 }
@@ -338,6 +341,7 @@ mod tests {
             provider: None,
             duration_ms: None,
             analysis_summary: None,
+            error: None,
             token_usage: TokenUsage::default(),
         };
         let json_iter = serde_json::to_string(&iter).expect("serialize");
@@ -357,6 +361,7 @@ mod tests {
             provider: None,
             duration_ms: None,
             analysis_summary: None,
+            error: None,
             token_usage: TokenUsage {
                 input_tokens: 123,
                 output_tokens: 45,
