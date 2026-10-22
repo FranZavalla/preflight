@@ -1021,10 +1021,12 @@ fn load_skills(skills_dir: &Path, skills_dir_arg: &str) -> Result<Vec<Vulnerabil
 
     entries.sort();
 
-    let skills = entries
+    let mut skills = entries
         .iter()
         .map(|path| load_skill_from_file(path))
         .collect::<Result<Vec<VulnerabilitySkill>>>()?;
+
+    sort_skills_by_severity(&mut skills);
 
     if skills.is_empty() {
         return Err(miette::miette!(
@@ -1052,10 +1054,34 @@ fn load_embedded_seed_skills() -> Result<Vec<VulnerabilitySkill>> {
         ),
     ];
 
-    seed_files
+    let mut skills = seed_files
         .iter()
         .map(|(path, content)| parse_skill_content(path, content))
-        .collect::<Result<Vec<VulnerabilitySkill>>>()
+        .collect::<Result<Vec<VulnerabilitySkill>>>()?;
+
+    sort_skills_by_severity(&mut skills);
+
+    Ok(skills)
+}
+
+fn severity_rank(severity: &str) -> u8 {
+    match severity.trim().to_ascii_lowercase().as_str() {
+        "critical" => 0,
+        "high" => 1,
+        "medium" => 2,
+        "low" => 3,
+        _ => 4,
+    }
+}
+
+/// Run higher-impact checks before low-severity optimizations, so a broad
+/// low-value skill cannot consume the budget ahead of a critical check.
+fn sort_skills_by_severity(skills: &mut [VulnerabilitySkill]) {
+    skills.sort_by(|a, b| {
+        severity_rank(&a.severity)
+            .cmp(&severity_rank(&b.severity))
+            .then_with(|| a.id.cmp(&b.id))
+    });
 }
 
 fn load_skill_from_file(path: &Path) -> Result<VulnerabilitySkill> {
@@ -1403,6 +1429,33 @@ body
             confidence_hint: None,
             guidance_markdown: String::new(),
         }
+    }
+
+    #[test]
+    fn severity_rank_orders_critical_before_optimizations() {
+        assert!(severity_rank("critical") < severity_rank("high"));
+        assert!(severity_rank("high") < severity_rank("medium"));
+        assert!(severity_rank("LOW") < severity_rank("unknown"));
+    }
+
+    #[test]
+    fn sorts_skills_by_severity_then_id() {
+        let mut skills = vec![
+            skill_named("004"),
+            skill_named("critical"),
+            skill_named("003"),
+        ];
+        skills[0].severity = "low".to_string();
+        skills[1].severity = "critical".to_string();
+        skills[2].severity = "medium".to_string();
+
+        sort_skills_by_severity(&mut skills);
+
+        let ids = skills
+            .iter()
+            .map(|skill| skill.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["critical", "003", "004"]);
     }
 
     fn permission_spec(root: &Path) -> PermissionPromptSpec {
