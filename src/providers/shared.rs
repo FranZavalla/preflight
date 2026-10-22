@@ -523,7 +523,7 @@ fn prompt_for_additional_agent_steps(
         "[audit][agent] {} reached the current max steps ({}) for skill '{}'",
         provider_label, max_steps, skill_id
     );
-    eprint!("Continue iterating? [y/N]: ");
+    eprint!("Continue iterating? [y/N] (N stops the whole audit): ");
     io::stderr().flush().into_diagnostic()?;
 
     let mut answer = String::new();
@@ -536,7 +536,10 @@ fn prompt_for_additional_agent_steps(
         return Ok(None);
     }
 
-    eprint!("How many additional steps? [default {}]: ", max_steps);
+    eprint!(
+        "How many additional steps? [default {}; 0 stops the whole audit]: ",
+        max_steps
+    );
     io::stderr().flush().into_diagnostic()?;
 
     let mut additional = String::new();
