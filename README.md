@@ -177,6 +177,7 @@ preflight [OPTIONS]
   --api-key-env <VAR>             Override the env var read for the API key.
   --reasoning-effort <LEVEL>      Reasoning effort hint. OpenAI/Ollama: low|medium|high. Anthropic: low|medium|high|max (max is Opus-tier only; rejected by Sonnet/Haiku).
   --ai-logs                       Print chat-style progress while auditing.
+  --max-agent-steps <N>           Maximum agent steps per skill.             [default: 30]
 
   --skills-dir <PATH>             Vulnerability skills directory.            [default: skills/vulnerabilities]
   --state-out <PATH>              Incremental state JSON path.               [default: .tx3/audit/state.json]
@@ -191,6 +192,8 @@ preflight [OPTIONS]
   --main-source <PATH>            Fallback source file when no .ak files are discovered.
   --exclude-tests                 Exclude *.tests.ak files from source discovery.
 ```
+
+When the step cap is reached interactively, declining to add steps stops the whole audit. Non-interactive runs fail that skill with a message to raise `--max-agent-steps`.
 
 ## Releases
 

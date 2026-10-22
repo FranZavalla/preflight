@@ -27,6 +27,7 @@ pub struct AnthropicProvider {
     pub version: String,
     pub ai_logs: bool,
     pub reasoning_effort: Option<String>,
+    pub max_agent_steps: usize,
 }
 
 fn build_anthropic_payload_variants(
@@ -577,6 +578,7 @@ impl AnalysisProvider for AnthropicProvider {
                 permission_prompt,
                 provider_label: "Anthropic provider",
                 skill_timeout: super::shared::DEFAULT_SKILL_TIMEOUT,
+                max_agent_steps: self.max_agent_steps,
             },
             &mut messages,
             |messages| {

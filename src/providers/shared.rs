@@ -2,7 +2,7 @@ use miette::{Context, IntoDiagnostic, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -14,7 +14,9 @@ use crate::model::{
     ValidatorContextMap, VulnerabilityFinding, VulnerabilitySkill,
 };
 
-pub(super) const MAX_AGENT_STEPS: usize = 30;
+/// Default per-skill agent step cap, shared by the CLI default and the
+/// interactive "how many more steps" default.
+pub(crate) const DEFAULT_MAX_AGENT_STEPS: usize = 30;
 /// Maximum time one skill may spend before it is abandoned.
 pub(crate) const DEFAULT_SKILL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Maximum time to wait for a read from the model endpoint.
@@ -249,7 +251,23 @@ pub(super) struct AgentLoopContext<'a> {
     pub(super) permission_prompt: &'a PermissionPromptSpec,
     pub(super) provider_label: &'a str,
     pub(super) skill_timeout: Duration,
+    pub(super) max_agent_steps: usize,
 }
+
+/// The user declined to keep iterating; the whole audit must stop rather than
+/// moving on to the next skill.
+#[derive(Debug)]
+pub(crate) struct UserStopped;
+
+impl std::fmt::Display for UserStopped {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("audit stopped by user at the agent step limit")
+    }
+}
+
+impl std::error::Error for UserStopped {}
+
+impl miette::Diagnostic for UserStopped {}
 
 pub(super) fn run_agent_loop<F>(
     skill: &VulnerabilitySkill,
@@ -267,10 +285,12 @@ where
         permission_prompt,
         provider_label,
         skill_timeout,
+        max_agent_steps,
     } = context;
 
     let deadline = Instant::now() + skill_timeout;
-    let mut max_steps = MAX_AGENT_STEPS;
+    let interactive = io::stdin().is_terminal();
+    let mut max_steps = max_agent_steps;
     let mut step_idx = 0usize;
     let mut total_usage = TokenUsage::default();
     let mut malformed_replies = 0usize;
@@ -287,9 +307,12 @@ where
         }
 
         if step_idx >= max_steps {
-            if let Some(additional) =
-                prompt_for_additional_agent_steps(provider_label, &skill.id, max_steps)?
-            {
+            if let Some(additional) = prompt_for_additional_agent_steps(
+                provider_label,
+                &skill.id,
+                max_steps,
+                interactive,
+            )? {
                 max_steps = max_steps.saturating_add(additional);
                 log_agent_progress(
                     ai_logs,
@@ -301,8 +324,12 @@ where
                 continue;
             }
 
+            if interactive {
+                return Err(miette::Report::new(UserStopped));
+            }
+
             return Err(miette::miette!(
-                "{} exceeded max interactive read steps ({}) for skill '{}' (enable --ai-logs to inspect progress)",
+                "{} exceeded max agent steps ({}) for skill '{}'; raise --max-agent-steps to continue",
                 provider_label,
                 max_steps,
                 skill.id
@@ -433,7 +460,7 @@ where
                         "Model completed skill '{}' at step {}/{} • status={} • findings={} • tokens=({})",
                         skill.id,
                         step_idx + 1,
-                        MAX_AGENT_STEPS,
+                        max_steps,
                         status,
                         findings,
                         format_token_usage_inline(&total_usage)
@@ -484,37 +511,57 @@ fn prompt_for_additional_agent_steps(
     provider_label: &str,
     skill_id: &str,
     max_steps: usize,
+    interactive: bool,
 ) -> Result<Option<usize>> {
+    // Non-interactive runs must never block on stdin. Raise --max-agent-steps
+    // instead of prompting when there is no terminal to answer.
+    if !interactive {
+        return Ok(None);
+    }
+
     eprintln!(
         "[audit][agent] {} reached the current max steps ({}) for skill '{}'",
         provider_label, max_steps, skill_id
     );
-    eprint!("Continue iterating? [y/N]: ");
+    eprint!("Continue iterating? [y/N] (N stops the whole audit): ");
     io::stderr().flush().into_diagnostic()?;
 
     let mut answer = String::new();
-    io::stdin().read_line(&mut answer).into_diagnostic()?;
+    if io::stdin().read_line(&mut answer).into_diagnostic()? == 0 {
+        return Ok(None);
+    }
+
     let accepted = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
     if !accepted {
         return Ok(None);
     }
 
-    eprint!("How many additional steps? [default {}]: ", MAX_AGENT_STEPS);
+    eprint!(
+        "How many additional steps? [default {}; 0 stops the whole audit]: ",
+        max_steps
+    );
     io::stderr().flush().into_diagnostic()?;
 
     let mut additional = String::new();
-    io::stdin().read_line(&mut additional).into_diagnostic()?;
-    let additional = additional.trim();
+    if io::stdin().read_line(&mut additional).into_diagnostic()? == 0 {
+        return Ok(None);
+    }
 
-    let parsed = if additional.is_empty() {
-        Some(MAX_AGENT_STEPS)
-    } else {
-        additional.parse::<usize>().ok()
-    };
+    Ok(additional_steps_from_answer(&additional, max_steps))
+}
 
-    match parsed {
-        Some(0) | None => Ok(None),
-        Some(value) => Ok(Some(value)),
+/// Empty input means "use the effective cap again". Zero or unparseable input
+/// means the user declined, which stops the whole audit.
+fn additional_steps_from_answer(answer: &str, max_steps: usize) -> Option<usize> {
+    let answer = answer.trim();
+
+    if answer.is_empty() {
+        return (max_steps > 0).then_some(max_steps);
+    }
+
+    match answer.parse::<usize>() {
+        Ok(0) | Err(_) => None,
+        Ok(value) => Some(value),
     }
 }
 
@@ -1888,7 +1935,26 @@ mod tests {
             permission_prompt: prompt,
             provider_label: "Test provider",
             skill_timeout: DEFAULT_SKILL_TIMEOUT,
+            max_agent_steps: DEFAULT_MAX_AGENT_STEPS,
         }
+    }
+
+    #[test]
+    fn additional_steps_default_to_effective_cap() {
+        assert_eq!(additional_steps_from_answer("", 7), Some(7));
+        assert_eq!(additional_steps_from_answer("", 0), None);
+        assert_eq!(additional_steps_from_answer(" \n", 60), Some(60));
+        assert_eq!(additional_steps_from_answer("5\n", 7), Some(5));
+        assert_eq!(additional_steps_from_answer("0", 7), None);
+        assert_eq!(additional_steps_from_answer("not-a-number", 7), None);
+    }
+
+    #[test]
+    fn non_interactive_runs_do_not_prompt_for_more_steps() {
+        let result = prompt_for_additional_agent_steps("Test provider", "skill", 30, false)
+            .expect("non-interactive prompt should not fail");
+
+        assert!(result.is_none());
     }
 
     #[test]
