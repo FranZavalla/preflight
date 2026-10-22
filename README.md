@@ -6,7 +6,7 @@
 
 ## How it works
 
-1. **Source discovery** — recursively scans the working directory for `.ak` files (skipping `target/`, `build/`, `.git/`, `.tx3/`, and nested projects with their own `aiken.toml`).
+1. **Source discovery** — recursively scans the working directory for `.ak` files (skipping `target/`, `build/`, `.git/`, `.tx3/`, and nested projects with their own `aiken.toml`). Use `--exclude <glob>` or `--exclude-tests` to keep test or legacy files out of the audit context.
 2. **AST generation** — parses each source file with `aiken-lang`, builds a per-validator context (handlers, parameters, source spans), and caches the snapshot to `.tx3/audit/aiken-ast.json`.
 3. **Skill loop** — for each vulnerability skill (markdown files with YAML frontmatter), invokes the configured provider with the skill prompt and AST context. The provider returns findings (or asks for additional file reads via a tool-call loop).
 4. **Persistence** — after every skill iteration, the analysis state is written to `.tx3/audit/state.json`. Pass `--resume` to skip completed skills and retry failed or missing ones after an interruption.
@@ -129,6 +129,8 @@ When the AI provider asks to read additional files, requests are gated:
 - `--read-scope strict` — only the source files discovered up front are readable.
 - `--interactive-permissions` — prompt the user before each AI-requested read.
 
+`--exclude` and `--exclude-tests` affect source discovery and the audit context. With `--read-scope strict`, excluded files are also unreadable.
+
 ## Vulnerability skills
 
 Each skill is a markdown file with YAML frontmatter. Place additional skills in `skills/vulnerabilities/` (or pass `--skills-dir <path>`). Frontmatter schema:
@@ -185,6 +187,8 @@ preflight [OPTIONS]
   --read-scope <SCOPE>            workspace | strict                         [default: workspace]
   --interactive-permissions       Confirm every AI-requested read.
   --main-source <PATH>            Fallback source file when no .ak files are discovered.
+  --exclude <GLOB>                Exclude source files matching a glob. Repeatable.
+  --exclude-tests                 Exclude *.tests.ak files from source discovery.
 ```
 
 ## Releases

@@ -975,7 +975,7 @@ fn file_name_of(path: &Path) -> String {
 
 /// Minimal shell-style glob supporting `*` and `?`, matching against the whole
 /// name. Enough for the model's `find_files` globs (`*.ak`, `*test*.compact`).
-fn glob_match(pattern: &str, name: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, name: &str) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let name: Vec<char> = name.chars().collect();
     let (mut p, mut n) = (0usize, 0usize);

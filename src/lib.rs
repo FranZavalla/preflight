@@ -14,7 +14,7 @@ use self::model::{
     SkillIterationResult, ValidatorContextMap, VulnerabilityFinding, VulnerabilityReportSpec,
     VulnerabilitySkill,
 };
-use self::providers::shared::is_ignored_path;
+use self::providers::shared::{glob_match, is_ignored_path};
 use self::providers::{AnalysisProvider, build_provider};
 
 const DEFAULT_SKILLS_DIR: &str = "skills/vulnerabilities";
@@ -112,6 +112,15 @@ pub struct Args {
     /// Fallback main source file path (used when no .ak files are discovered).
     #[arg(long)]
     pub main_source: Option<String>,
+
+    /// Exclude source files whose relative path or file name matches this glob.
+    /// Repeatable; supports `*` and `?`.
+    #[arg(long)]
+    pub exclude: Vec<String>,
+
+    /// Exclude `*.tests.ak` files from source discovery and the audit context.
+    #[arg(long, default_value_t = false)]
+    pub exclude_tests: bool,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -125,7 +134,11 @@ fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
     let report_out = PathBuf::from(&args.report_out);
     let ast_out = PathBuf::from(&args.ast_out);
     let project_root = std::env::current_dir().into_diagnostic()?;
-    let aiken_source_files = discover_source_files(&project_root)?;
+    let mut exclude_patterns = args.exclude.clone();
+    if args.exclude_tests {
+        exclude_patterns.push("*.tests.ak".to_string());
+    }
+    let aiken_source_files = discover_source_files(&project_root, &exclude_patterns)?;
     let source_files = if aiken_source_files.is_empty() {
         if let Some(main_source) = &args.main_source {
             vec![PathBuf::from(main_source)]
@@ -609,7 +622,7 @@ fn display_path_for_prompt(project_root: &Path, path: &Path) -> String {
         .unwrap_or_else(|_| path.display().to_string())
 }
 
-fn discover_source_files(project_root: &Path) -> Result<Vec<PathBuf>> {
+fn discover_source_files(project_root: &Path, exclude_patterns: &[String]) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let mut to_visit = vec![project_root.to_path_buf()];
 
@@ -638,7 +651,7 @@ fn discover_source_files(project_root: &Path) -> Result<Vec<PathBuf>> {
                 .map(|ext| ext.eq_ignore_ascii_case("ak"))
                 .unwrap_or(false);
 
-            if is_source_file {
+            if is_source_file && !is_excluded_source(project_root, &path, exclude_patterns) {
                 files.push(path);
             }
         }
@@ -646,6 +659,23 @@ fn discover_source_files(project_root: &Path) -> Result<Vec<PathBuf>> {
 
     files.sort();
     Ok(files)
+}
+
+fn is_excluded_source(project_root: &Path, path: &Path, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+
+    let relative = path.strip_prefix(project_root).unwrap_or(path);
+    let relative = relative.to_string_lossy();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+
+    patterns
+        .iter()
+        .any(|pattern| glob_match(pattern, &relative) || glob_match(pattern, file_name))
 }
 
 fn build_mini_prompt(skill: &VulnerabilitySkill) -> MiniPrompt {
@@ -1223,7 +1253,7 @@ body
         fs::write(validators.join("spend.ak"), "validator spend {}").expect("write ak file");
         fs::write(validators.join("readme.md"), "# ignore").expect("write non-ak file");
 
-        let files = discover_source_files(root).expect("should discover files");
+        let files = discover_source_files(root, &[]).expect("should discover files");
 
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("onchain/validators/spend.ak"));
@@ -1249,10 +1279,49 @@ body
         fs::write(tx3_dir.join("skip2.ak"), "validator skip2 {}").expect("write ak in tx3");
         fs::write(build_dir.join("skip3.ak"), "validator skip3 {}").expect("write ak in build");
 
-        let files = discover_source_files(root).expect("should discover files");
+        let files = discover_source_files(root, &[]).expect("should discover files");
 
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("contracts/ok.ak"));
+    }
+
+    #[test]
+    fn discover_source_files_includes_tests_by_default() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        let validators = root.join("validators");
+
+        fs::create_dir_all(&validators).expect("create validators");
+        fs::write(validators.join("spend.ak"), "validator spend {}").expect("write source");
+        fs::write(validators.join("spend.tests.ak"), "test spend {}").expect("write test");
+
+        let files = discover_source_files(root, &[]).expect("should discover files");
+
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn discover_source_files_applies_exclude_patterns() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        let validators = root.join("validators");
+        let legacy = root.join("legacy");
+
+        fs::create_dir_all(&validators).expect("create validators");
+        fs::create_dir_all(&legacy).expect("create legacy");
+        fs::write(validators.join("spend.ak"), "validator spend {}").expect("write source");
+        fs::write(validators.join("spend.tests.ak"), "test spend {}").expect("write test");
+        fs::write(legacy.join("old.ak"), "validator old {}").expect("write legacy");
+
+        let files = discover_source_files(root, &["*.tests.ak".to_string()])
+            .expect("should discover files");
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|path| !path.ends_with("spend.tests.ak")));
+
+        let files = discover_source_files(root, &["legacy/*.ak".to_string()])
+            .expect("should discover files");
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|path| !path.ends_with("legacy/old.ak")));
     }
 
     #[test]
