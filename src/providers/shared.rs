@@ -556,7 +556,7 @@ fn additional_steps_from_answer(answer: &str, max_steps: usize) -> Option<usize>
     let answer = answer.trim();
 
     if answer.is_empty() {
-        return Some(max_steps);
+        return (max_steps > 0).then_some(max_steps);
     }
 
     match answer.parse::<usize>() {
@@ -1942,6 +1942,7 @@ mod tests {
     #[test]
     fn additional_steps_default_to_effective_cap() {
         assert_eq!(additional_steps_from_answer("", 7), Some(7));
+        assert_eq!(additional_steps_from_answer("", 0), None);
         assert_eq!(additional_steps_from_answer(" \n", 60), Some(60));
         assert_eq!(additional_steps_from_answer("5\n", 7), Some(5));
         assert_eq!(additional_steps_from_answer("0", 7), None);
