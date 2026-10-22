@@ -1307,6 +1307,15 @@ pub(super) fn iteration_from_parsed(
         .filter(|value| !value.trim().is_empty())
         .map(ToString::to_string);
 
+    let error = parsed
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            (status == "failed").then(|| "provider reported failure without a reason".to_string())
+        });
+
     SkillIterationResult {
         skill_id: skill.id.clone(),
         status,
@@ -1316,6 +1325,7 @@ pub(super) fn iteration_from_parsed(
         provider: None,
         duration_ms: None,
         analysis_summary,
+        error,
         token_usage,
     }
 }
@@ -1944,5 +1954,34 @@ mod tests {
             iteration.analysis_summary.as_deref(),
             Some("checked the spend path")
         );
+        assert!(iteration.error.is_none());
+    }
+
+    #[test]
+    fn iteration_from_parsed_defaults_error_for_failed_status() {
+        let parsed = json!({
+            "status": "failed",
+            "findings": []
+        });
+
+        let iteration = iteration_from_parsed(&dummy_skill(), parsed, TokenUsage::default());
+
+        assert_eq!(
+            iteration.error.as_deref(),
+            Some("provider reported failure without a reason")
+        );
+    }
+
+    #[test]
+    fn iteration_from_parsed_reads_error_when_present() {
+        let parsed = json!({
+            "status": "failed",
+            "error": "429 Too Many Requests",
+            "findings": []
+        });
+
+        let iteration = iteration_from_parsed(&dummy_skill(), parsed, TokenUsage::default());
+
+        assert_eq!(iteration.error.as_deref(), Some("429 Too Many Requests"));
     }
 }

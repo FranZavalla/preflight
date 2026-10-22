@@ -330,6 +330,7 @@ fn run_skill_loop(
             // the time skill 9 comes around.
             Err(error) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
+                let error_text = truncate_error_text(&error.to_string());
 
                 log_audit_progress(
                     context.ai_logs,
@@ -352,6 +353,7 @@ fn run_skill_loop(
                     provider: Some(provider_spec.clone()),
                     duration_ms: Some(started.elapsed().as_millis() as u64),
                     analysis_summary: None,
+                    error: Some(error_text),
                     token_usage: crate::model::TokenUsage::default(),
                 };
 
@@ -797,13 +799,14 @@ fn render_coverage_markdown(
             .rev()
             .find(|iteration| iteration.skill_id == skill.id);
 
-        let (status, findings, summary) = match iteration {
+        let (status, findings, summary, error) = match iteration {
             Some(iteration) => (
                 iteration.status.as_str(),
                 iteration.findings.len(),
                 iteration.analysis_summary.as_deref(),
+                iteration.error.as_deref(),
             ),
-            None => ("not run", 0, None),
+            None => ("not run", 0, None, None),
         };
 
         match status {
@@ -823,13 +826,16 @@ fn render_coverage_markdown(
             .and_then(|iteration| iteration.duration_ms)
             .map(format_duration_ms)
             .unwrap_or_else(|| "time unknown".to_string());
+        let error = error
+            .map(|value| format!(" — error: {}", truncate_error_text(value)))
+            .unwrap_or_default();
         let summary = summary
             .map(|value| format!(" — summary: {}", truncate_summary_text(value)))
             .unwrap_or_default();
 
         skill_lines.push(format!(
-            "- `{}` — {} — {} finding(s) — {} — {}{}",
-            skill.id, status, findings, provider, duration, summary
+            "- `{}` — {} — {} finding(s) — {} — {}{}{}",
+            skill.id, status, findings, provider, duration, error, summary
         ));
     }
 
@@ -919,6 +925,26 @@ fn truncate_summary_text(summary: &str) -> String {
 
     let truncated = summary.chars().take(MAX_CHARS).collect::<String>();
     format!("{}…", truncated)
+}
+
+fn truncate_error_text(error: &str) -> String {
+    const MAX_CHARS: usize = 500;
+    const HEAD_CHARS: usize = 300;
+    const TAIL_CHARS: usize = 150;
+
+    let error = error.trim().replace('\n', " ");
+    let total = error.chars().count();
+    if total <= MAX_CHARS {
+        return error;
+    }
+
+    // Keep both ends: miette context wrappers put the request at the head and
+    // the actionable cause (for example "Stopping: ...") at the tail.
+    let head = error.chars().take(HEAD_CHARS).collect::<String>();
+    let tail = error.chars().skip(total - TAIL_CHARS).collect::<String>();
+    let omitted = total.saturating_sub(HEAD_CHARS + TAIL_CHARS);
+
+    format!("{} … <omitted {} chars> … {}", head, omitted, tail)
 }
 
 fn load_skills(skills_dir: &Path, skills_dir_arg: &str) -> Result<Vec<VulnerabilitySkill>> {
@@ -1364,6 +1390,7 @@ body
                     provider: None,
                     duration_ms: None,
                     analysis_summary: None,
+                    error: None,
                     token_usage: crate::model::TokenUsage::default(),
                 })
             }
@@ -1402,6 +1429,13 @@ body
         assert_eq!(state.iterations.len(), 3);
         assert_eq!(state.iterations[0].status, "completed");
         assert_eq!(state.iterations[1].status, "failed");
+        assert!(
+            state.iterations[1]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("429")
+        );
         assert_eq!(state.iterations[2].status, "completed");
     }
 
@@ -1496,6 +1530,7 @@ body
             }),
             duration_ms,
             analysis_summary: None,
+            error: None,
             token_usage: crate::model::TokenUsage::default(),
         }
     }
@@ -1510,6 +1545,7 @@ body
             provider: None,
             duration_ms: None,
             analysis_summary: None,
+            error: None,
             token_usage: crate::model::TokenUsage::default(),
         }
     }
@@ -2068,6 +2104,25 @@ body
     }
 
     #[test]
+    fn report_coverage_includes_failure_reason() {
+        let skills = vec![skill_named("a")];
+        let mut failed =
+            iteration_with_fingerprint("a", "failed", "sha256:a", Some("test"), Some(10));
+        failed.error = Some("429 Too Many Requests".to_string());
+
+        let mut state = empty_state();
+        state.iterations = vec![failed];
+
+        let report = build_report(&state, &skills, false);
+
+        assert!(
+            report
+                .coverage_markdown
+                .contains("error: 429 Too Many Requests")
+        );
+    }
+
+    #[test]
     fn report_coverage_marks_incomplete_audits() {
         let skills = vec![skill_named("a"), skill_named("b")];
         let mut state = empty_state();
@@ -2159,5 +2214,33 @@ body
         assert_eq!(format_duration_ms(500), "500ms");
         assert_eq!(format_duration_ms(1_500), "1.5s");
         assert_eq!(format_duration_ms(65_000), "1m 5s");
+    }
+
+    #[test]
+    fn truncate_error_text_keeps_both_ends() {
+        let error = format!("{}{}{}", "start ".repeat(100), "x".repeat(1000), " cause");
+        let truncated = truncate_error_text(&error);
+
+        assert!(truncated.starts_with("start "));
+        assert!(truncated.contains("omitted"));
+        assert!(truncated.ends_with("cause"));
+        assert!(truncated.len() < error.len());
+    }
+
+    #[test]
+    fn truncate_error_text_handles_multibyte_input() {
+        let error = format!("{}{}", "é".repeat(1000), " done");
+        let truncated = truncate_error_text(&error);
+
+        assert!(truncated.contains("omitted"));
+        assert!(truncated.ends_with(" done"));
+    }
+
+    #[test]
+    fn truncate_error_text_leaves_short_errors_unchanged() {
+        assert_eq!(
+            truncate_error_text("429 Too Many Requests"),
+            "429 Too Many Requests"
+        );
     }
 }

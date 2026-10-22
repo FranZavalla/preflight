@@ -43,6 +43,7 @@ impl AnalysisProvider for ScaffoldProvider {
             provider: None,
             duration_ms: None,
             analysis_summary: None,
+            error: None,
             token_usage: Default::default(),
         })
     }
