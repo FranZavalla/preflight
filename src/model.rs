@@ -143,6 +143,11 @@ pub struct AstToolMetadata {
 pub struct ValidatorContextMap {
     #[serde(default)]
     pub validators: Vec<ValidatorContextEntry>,
+    /// Top-level (helper) functions. Validators are listed separately; helpers
+    /// are surfaced so a skill can see functions it depends on without having to
+    /// guess which file to open, including in modules that declare no validator.
+    #[serde(default)]
+    pub functions: Vec<FunctionContextEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +164,16 @@ pub struct ValidatorContextEntry {
 pub struct SourceSpan {
     pub start_line: usize,
     pub end_line: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionContextEntry {
+    pub id: String,
+    pub module: String,
+    pub source_file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_span: Option<SourceSpan>,
+    pub parameters: Vec<ValidatorParameterContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

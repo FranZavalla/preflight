@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::model::{
-    AstMetadata, AstToolMetadata, SourceSpan, ValidatorContextEntry, ValidatorContextMap,
-    ValidatorHandlerContext, ValidatorParameterContext,
+    AstMetadata, AstToolMetadata, FunctionContextEntry, SourceSpan, ValidatorContextEntry,
+    ValidatorContextMap, ValidatorHandlerContext, ValidatorParameterContext,
 };
 
 #[derive(Debug, Clone)]
@@ -21,6 +21,10 @@ pub struct AstBuildOutput {
     pub metadata: AstMetadata,
     pub validator_context: ValidatorContextMap,
 }
+
+/// Bumped whenever the shape of the AST snapshot or `validator_context`
+/// changes, so caches written by older binaries are reparsed.
+const AST_SCHEMA_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AstSnapshot {
@@ -67,7 +71,9 @@ pub fn generate_ast_and_validator_context(
             .into_diagnostic()
             .context("AST output unreadable/invalid JSON")?;
 
-        if cached_snapshot.source_fingerprint == source_fingerprint {
+        if cached_snapshot.source_fingerprint == source_fingerprint
+            && cached_snapshot.schema_version == AST_SCHEMA_VERSION
+        {
             return Ok(AstBuildOutput {
                 metadata: AstMetadata {
                     path: display_path_for_state(project_root, ast_out_path),
@@ -126,7 +132,7 @@ pub fn generate_ast_and_validator_context(
         .collect::<Vec<_>>();
 
     let snapshot = AstSnapshot {
-        schema_version: 1,
+        schema_version: AST_SCHEMA_VERSION,
         generated_at: Utc::now().to_rfc3339(),
         tool: AstToolMetadata {
             name: "aiken".to_string(),
@@ -222,7 +228,45 @@ fn build_validator_context_from_modules(modules: &[ParsedModule]) -> ValidatorCo
             .then_with(|| left.source_file.cmp(&right.source_file))
     });
 
-    ValidatorContextMap { validators }
+    let mut functions = modules
+        .iter()
+        .flat_map(|module_snapshot| {
+            module_snapshot
+                .module
+                .definitions
+                .iter()
+                .filter_map(|definition| {
+                    let UntypedDefinition::Fn(function) = definition else {
+                        return None;
+                    };
+
+                    let module_id = module_name_from_source_file(&module_snapshot.source_file);
+                    let id = format!("{}.{}", module_id, function.name);
+
+                    Some(FunctionContextEntry {
+                        id,
+                        module: module_id,
+                        source_file: module_snapshot.source_file.clone(),
+                        source_span: resolve_source_span(
+                            &module_snapshot.module,
+                            function.location,
+                        ),
+                        parameters: function_to_handler_context(function).parameters,
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+
+    functions.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.source_file.cmp(&right.source_file))
+    });
+
+    ValidatorContextMap {
+        validators,
+        functions,
+    }
 }
 
 fn function_to_handler_context(function: &UntypedFunction) -> ValidatorHandlerContext {
@@ -452,6 +496,92 @@ validator alpha {
                 "validators.sample.zeta".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn validator_context_extracts_top_level_functions() {
+        let src = r#"
+use cardano/transaction.{OutputReference}
+
+pub fn helper(anchor_ref: OutputReference, labels: List<ByteArray>) -> Bool {
+  True
+}
+
+validator hello_world {
+  else(_) { True }
+}
+"#;
+
+        let (module, _) = parser::module(src, ModuleKind::Validator).expect("parse module");
+        let context = build_validator_context_from_modules(&[ParsedModule {
+            source_file: "onchain/validators/order.ak".to_string(),
+            module,
+            ast_debug: String::new(),
+        }]);
+
+        assert_eq!(context.validators.len(), 1);
+        assert_eq!(context.functions.len(), 1);
+
+        let function = &context.functions[0];
+        assert_eq!(function.id, "onchain.validators.order.helper");
+        assert_eq!(function.module, "onchain.validators.order");
+        assert_eq!(function.source_file, "onchain/validators/order.ak");
+        assert_eq!(function.parameters[0].name, "anchor_ref");
+        assert_eq!(function.parameters[1].r#type, "List<ByteArray>");
+        assert!(function.source_span.is_some());
+    }
+
+    #[test]
+    fn generate_ast_ignores_cache_written_by_older_schema_version() {
+        // A cache from an older binary may lack `functions`, so the schema
+        // version must gate cache reuse, not just the source fingerprint.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        let source = root.join("validators/order.ak");
+        let ast_out = root.join(".tx3/audit/aiken-ast.json");
+
+        fs::create_dir_all(source.parent().expect("parent")).expect("create parent dir");
+        fs::write(
+            &source,
+            "pub fn mint_unique(anchor_ref: ByteArray) -> Bool { True }\n",
+        )
+        .expect("write source file");
+
+        let source_fingerprint =
+            fingerprint_sources(root, std::slice::from_ref(&source)).expect("fingerprint");
+
+        let old_snapshot = AstSnapshot {
+            schema_version: 1,
+            generated_at: "1970-01-01T00:00:00Z".to_string(),
+            tool: AstToolMetadata {
+                name: "aiken".to_string(),
+                version: "old".to_string(),
+            },
+            source_fingerprint,
+            files: vec![],
+            validator_context: ValidatorContextMap::default(),
+        };
+
+        fs::create_dir_all(ast_out.parent().expect("parent")).expect("create ast dir");
+        fs::write(
+            &ast_out,
+            serde_json::to_string_pretty(&old_snapshot).expect("serialize old snapshot"),
+        )
+        .expect("write cache");
+
+        let output = generate_ast_and_validator_context(root, &[source], &ast_out, false)
+            .expect("should reparse instead of reusing an older-schema cache");
+
+        assert_eq!(
+            output.validator_context.functions.len(),
+            1,
+            "functions must be populated after reparsing"
+        );
+
+        let snapshot: AstSnapshot =
+            serde_json::from_str(&fs::read_to_string(&ast_out).expect("read snapshot"))
+                .expect("valid snapshot json");
+        assert_eq!(snapshot.schema_version, AST_SCHEMA_VERSION);
     }
 
     #[test]

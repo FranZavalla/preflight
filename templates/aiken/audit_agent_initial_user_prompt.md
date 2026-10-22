@@ -17,7 +17,7 @@ Validator context map:
 {{VALIDATOR_CONTEXT_MAP}}
 --- CONTEXT MAP END ---
 
-Use the referenced files as your starting point. You may read additional files only if they are inside the allowed workspace scope and strictly required to validate the finding.
+Use the referenced files as your starting point. Top-level functions are listed by signature and source file; read the relevant file when a helper is needed. You may read additional files only if they are inside the allowed workspace scope and strictly required to validate the finding.
 
 Execution permissions:
 --- PERMISSION PROMPT START ---
