@@ -111,6 +111,9 @@ pub struct VulnerabilityFinding {
 pub struct AnalysisStateJson {
     pub version: String,
     pub source_files: Vec<String>,
+    /// Patterns used to exclude sources from discovery, if any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_patterns: Vec<String>,
     pub provider: ProviderSpec,
     pub permission_prompt: PermissionPromptSpec,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -14,7 +14,7 @@ use self::model::{
     SkillIterationResult, ValidatorContextMap, VulnerabilityFinding, VulnerabilityReportSpec,
     VulnerabilitySkill,
 };
-use self::providers::shared::is_ignored_path;
+use self::providers::shared::{glob_match, is_ignored_path};
 use self::providers::{AnalysisProvider, build_provider};
 
 const DEFAULT_SKILLS_DIR: &str = "skills/vulnerabilities";
@@ -112,6 +112,10 @@ pub struct Args {
     /// Fallback main source file path (used when no .ak files are discovered).
     #[arg(long)]
     pub main_source: Option<String>,
+
+    /// Exclude `*.tests.ak` files from source discovery and the audit context.
+    #[arg(long, default_value_t = false)]
+    pub exclude_tests: bool,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -125,10 +129,24 @@ fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
     let report_out = PathBuf::from(&args.report_out);
     let ast_out = PathBuf::from(&args.ast_out);
     let project_root = std::env::current_dir().into_diagnostic()?;
-    let aiken_source_files = discover_source_files(&project_root)?;
+    let exclude_patterns = build_exclude_patterns(args.exclude_tests);
+    let aiken_source_files = discover_source_files(&project_root, &exclude_patterns)?;
     let source_files = if aiken_source_files.is_empty() {
+        // `--main-source` is an explicit opt-in to a single file, so it still
+        // wins when excluding tests removed everything; warn so the override is
+        // not silent.
         if let Some(main_source) = &args.main_source {
+            if args.exclude_tests {
+                eprintln!(
+                    "⚠️  Excluding test files left no discovered sources; auditing --main-source {} instead.",
+                    main_source
+                );
+            }
             vec![PathBuf::from(main_source)]
+        } else if args.exclude_tests {
+            return Err(miette::miette!(
+                "No .ak source files left after excluding *.tests.ak; remove --exclude-tests or pass --main-source"
+            ));
         } else {
             return Err(miette::miette!(
                 "No .ak source files found and no --main-source specified"
@@ -167,6 +185,7 @@ fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
             .iter()
             .map(|path| path.display().to_string())
             .collect(),
+        excluded_patterns: exclude_patterns.clone(),
         provider: provider.provider_spec(),
         permission_prompt: permission_prompt.clone(),
         ast: Some(ast_context.metadata.clone()),
@@ -611,7 +630,17 @@ fn display_path_for_prompt(project_root: &Path, path: &Path) -> String {
         .unwrap_or_else(|_| path.display().to_string())
 }
 
-fn discover_source_files(project_root: &Path) -> Result<Vec<PathBuf>> {
+const TEST_SOURCE_GLOB: &str = "*.tests.ak";
+
+fn build_exclude_patterns(exclude_tests: bool) -> Vec<String> {
+    if exclude_tests {
+        vec![TEST_SOURCE_GLOB.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn discover_source_files(project_root: &Path, exclude_patterns: &[String]) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let mut to_visit = vec![project_root.to_path_buf()];
 
@@ -640,7 +669,7 @@ fn discover_source_files(project_root: &Path) -> Result<Vec<PathBuf>> {
                 .map(|ext| ext.eq_ignore_ascii_case("ak"))
                 .unwrap_or(false);
 
-            if is_source_file {
+            if is_source_file && !is_excluded_source(project_root, &path, exclude_patterns) {
                 files.push(path);
             }
         }
@@ -648,6 +677,23 @@ fn discover_source_files(project_root: &Path) -> Result<Vec<PathBuf>> {
 
     files.sort();
     Ok(files)
+}
+
+fn is_excluded_source(project_root: &Path, path: &Path, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+
+    let relative = path.strip_prefix(project_root).unwrap_or(path);
+    let relative = relative.to_string_lossy();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+
+    patterns
+        .iter()
+        .any(|pattern| glob_match(pattern, &relative) || glob_match(pattern, file_name))
 }
 
 fn build_mini_prompt(skill: &VulnerabilitySkill) -> MiniPrompt {
@@ -879,6 +925,13 @@ fn render_coverage_markdown(
         format_total_token_usage(&state.total_token_usage),
         format_duration_ms(state.total_duration_ms),
     ));
+
+    if !state.excluded_patterns.is_empty() {
+        coverage.push_str(&format!(
+            "\n- Excluded patterns: {}",
+            state.excluded_patterns.join(", ")
+        ));
+    }
 
     if ignored > 0 {
         coverage.push_str(&format!(
@@ -1249,7 +1302,7 @@ body
         fs::write(validators.join("spend.ak"), "validator spend {}").expect("write ak file");
         fs::write(validators.join("readme.md"), "# ignore").expect("write non-ak file");
 
-        let files = discover_source_files(root).expect("should discover files");
+        let files = discover_source_files(root, &[]).expect("should discover files");
 
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("onchain/validators/spend.ak"));
@@ -1275,10 +1328,48 @@ body
         fs::write(tx3_dir.join("skip2.ak"), "validator skip2 {}").expect("write ak in tx3");
         fs::write(build_dir.join("skip3.ak"), "validator skip3 {}").expect("write ak in build");
 
-        let files = discover_source_files(root).expect("should discover files");
+        let files = discover_source_files(root, &[]).expect("should discover files");
 
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("contracts/ok.ak"));
+    }
+
+    #[test]
+    fn discover_source_files_includes_tests_by_default() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        let validators = root.join("validators");
+
+        fs::create_dir_all(&validators).expect("create validators");
+        fs::write(validators.join("spend.ak"), "validator spend {}").expect("write source");
+        fs::write(validators.join("spend.tests.ak"), "test spend {}").expect("write test");
+
+        let files = discover_source_files(root, &[]).expect("should discover files");
+
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn discover_source_files_excludes_tests_when_pattern_applied() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        let validators = root.join("validators");
+
+        fs::create_dir_all(&validators).expect("create validators");
+        fs::write(validators.join("spend.ak"), "validator spend {}").expect("write source");
+        fs::write(validators.join("spend.tests.ak"), "test spend {}").expect("write test");
+
+        let files = discover_source_files(root, &build_exclude_patterns(true))
+            .expect("should discover files");
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("validators/spend.ak"));
+    }
+
+    #[test]
+    fn build_exclude_patterns_maps_the_exclude_tests_flag() {
+        assert!(build_exclude_patterns(false).is_empty());
+        assert_eq!(build_exclude_patterns(true), vec!["*.tests.ak".to_string()]);
     }
 
     #[test]
@@ -1330,6 +1421,7 @@ body
         AnalysisStateJson {
             version: "2".to_string(),
             source_files: Vec::new(),
+            excluded_patterns: Vec::new(),
             provider: crate::model::ProviderSpec {
                 name: "test".to_string(),
                 model: None,
@@ -2189,6 +2281,20 @@ body
         let report = build_report(&state, &skills, false);
 
         assert!(!report.coverage_markdown.contains("Status: INCOMPLETE"));
+    }
+
+    #[test]
+    fn report_coverage_lists_excluded_patterns() {
+        let mut state = empty_state();
+        state.excluded_patterns = vec!["*.tests.ak".to_string()];
+
+        let report = build_report(&state, &[], false);
+
+        assert!(
+            report
+                .coverage_markdown
+                .contains("Excluded patterns: *.tests.ak")
+        );
     }
 
     #[test]
