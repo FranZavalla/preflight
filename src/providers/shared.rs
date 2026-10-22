@@ -183,6 +183,14 @@ pub(super) fn stream_content_delta_to_stdout(
         state.ends_with_newline = false;
     }
 
+    let compact = compact_stream_delta(state, delta);
+    let _ = write!(stdout, "{}", compact);
+    let _ = stdout.flush();
+}
+
+/// Collapses repeated newlines and strips `\r` while preserving the state
+/// needed to handle a blank line split across two streamed deltas.
+fn compact_stream_delta(state: &mut ContentStreamState, delta: &str) -> String {
     let mut compact = String::with_capacity(delta.len());
     for character in delta.chars() {
         if character == '\r' {
@@ -200,8 +208,7 @@ pub(super) fn stream_content_delta_to_stdout(
         }
     }
 
-    let _ = write!(stdout, "{}", compact);
-    let _ = stdout.flush();
+    compact
 }
 
 pub(super) fn finalize_content_stdout(enabled: bool, state: &mut ContentStreamState) {
@@ -412,18 +419,6 @@ where
             "content": &content,
         }));
 
-        // Streaming already printed the reply. Only fall back to a compact dump
-        // for non-stream requests, and never repeat the raw multi-line payload.
-        if !streamed {
-            log_agent_progress(
-                ai_logs,
-                format!(
-                    "Model output (non-stream): {}",
-                    compact_model_output(&content)
-                ),
-            );
-        }
-
         let action = match parse_agent_action(&content) {
             Ok(action) => {
                 malformed_replies = 0;
@@ -440,6 +435,16 @@ where
                         "{} returned {} unparseable replies in a row for skill '{}'",
                         provider_label, malformed_replies, skill.id
                     ));
+                }
+
+                if !streamed {
+                    log_agent_progress(
+                        ai_logs,
+                        format!(
+                            "Model output (non-stream): {}",
+                            compact_model_output(&content)
+                        ),
+                    );
                 }
 
                 log_agent_progress(
@@ -1983,6 +1988,19 @@ mod tests {
         assert!(prompt.contains("read_file lib/a.ak"));
         // Rust `Debug` syntax must not leak into the model prompt.
         assert!(!prompt.contains("ReadFile {"));
+    }
+
+    #[test]
+    fn streamed_content_collapses_blank_lines_across_deltas() {
+        let mut state = ContentStreamState::default();
+
+        assert_eq!(compact_stream_delta(&mut state, "a\r\n\n"), "a\n");
+        assert_eq!(
+            compact_stream_delta(&mut state, "\n\nb"),
+            "b",
+            "a blank line split across deltas must still collapse"
+        );
+        assert_eq!(compact_stream_delta(&mut state, "\r\nc"), "\nc");
     }
 
     #[test]
