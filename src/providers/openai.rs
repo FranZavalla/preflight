@@ -5,10 +5,11 @@ use std::time::{Duration, Instant};
 
 use super::AnalysisProvider;
 use super::shared::{
-    ContentStreamState, ReasoningStreamState, block_on_runtime_aware, build_agent_system_prompt,
-    build_initial_user_prompt, emit_reasoning_double_line_break, emit_reasoning_line_break,
-    finalize_content_stdout, finalize_reasoning_stdout, log_agent_progress, run_agent_loop,
-    stream_content_delta_to_stdout, stream_reasoning_delta_to_stdout,
+    ContentStreamState, ModelReply, ReasoningStreamState, block_on_runtime_aware,
+    build_agent_system_prompt, build_initial_user_prompt, emit_reasoning_double_line_break,
+    emit_reasoning_line_break, finalize_content_stdout, finalize_reasoning_stdout,
+    log_agent_progress, run_agent_loop, stream_content_delta_to_stdout,
+    stream_reasoning_delta_to_stdout,
 };
 use crate::model::{
     MiniPrompt, PermissionPromptSpec, ProviderSpec, SkillIterationResult, TokenUsage,
@@ -1412,7 +1413,13 @@ impl AnalysisProvider for OpenAiProvider {
                             )
                             .await
                             {
-                                Ok(content) => return Ok(content),
+                                Ok((content, usage)) => {
+                                    return Ok(ModelReply {
+                                        content,
+                                        usage,
+                                        streamed: true,
+                                    });
+                                }
                                 // Account-level failures cannot be fixed by another
                                 // payload variant or by falling back to non-streaming.
                                 Err(failure) if should_abort_turn(&failure) => {
@@ -1482,7 +1489,13 @@ impl AnalysisProvider for OpenAiProvider {
                         )
                         .await
                         {
-                            Ok(content) => return Ok(content),
+                            Ok((content, usage)) => {
+                                return Ok(ModelReply {
+                                    content,
+                                    usage,
+                                    streamed: false,
+                                });
+                            }
                             // Account-level failures cannot be fixed by another
                             // payload variant or by a non-stream retry.
                             Err(failure) if should_abort_turn(&failure) => {
