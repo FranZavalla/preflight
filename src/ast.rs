@@ -245,7 +245,7 @@ fn build_validator_context_from_modules(modules: &[ParsedModule]) -> ValidatorCo
 
                     Some(FunctionContextEntry {
                         id,
-                        module: module_snapshot.source_file.clone(),
+                        module: module_id,
                         source_file: module_snapshot.source_file.clone(),
                         source_span: resolve_source_span(
                             &module_snapshot.module,
@@ -524,6 +524,7 @@ validator hello_world {
 
         let function = &context.functions[0];
         assert_eq!(function.id, "onchain.validators.order.helper");
+        assert_eq!(function.module, "onchain.validators.order");
         assert_eq!(function.source_file, "onchain/validators/order.ak");
         assert_eq!(function.parameters[0].name, "anchor_ref");
         assert_eq!(function.parameters[1].r#type, "List<ByteArray>");

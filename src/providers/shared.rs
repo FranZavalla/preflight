@@ -566,6 +566,10 @@ fn render_validator_context_map(validator_context: &ValidatorContextMap) -> Stri
 /// Signatures only, grouped by source file. Bodies are read on demand by the
 /// model; this block exists to make helpers discoverable without guessing which
 /// file to open.
+///
+/// This caps the helper block only. The skill, source references, validator
+/// map, and permission prompt are separate sections and are not covered by a
+/// global prompt budget.
 const MAX_HELPER_CONTEXT_CHARS: usize = 4 * 1024;
 
 fn render_helper_context(functions: &[FunctionContextEntry]) -> String {
@@ -609,6 +613,14 @@ fn render_helper_context(functions: &[FunctionContextEntry]) -> String {
     while cut > 0 && !rendered.is_char_boundary(cut) {
         cut -= 1;
     }
+
+    // Prefer a line boundary so the model never sees a half signature. Only
+    // trim to it when it does not throw away most of the budget.
+    let cut = rendered[..cut]
+        .rfind('\n')
+        .map(|newline| newline + 1)
+        .filter(|line_cut| line_cut.saturating_mul(2) >= cut)
+        .unwrap_or(cut);
 
     format!(
         "{}\n… (helper context truncated: {} of {} chars shown; use grep or read_file for the rest)",
@@ -1451,7 +1463,7 @@ mod tests {
             validators: vec![],
             functions: vec![FunctionContextEntry {
                 id: "validators.order.mint_unique".to_string(),
-                module: "validators/order.ak".to_string(),
+                module: "validators.order".to_string(),
                 source_file: "validators/order.ak".to_string(),
                 source_span: None,
                 parameters: vec![ValidatorParameterContext {
@@ -1481,7 +1493,7 @@ mod tests {
         let functions = (0..200)
             .map(|index| FunctionContextEntry {
                 id: format!("validators.big.helper_{}", index),
-                module: "validators/big.ak".to_string(),
+                module: "validators.big".to_string(),
                 source_file: "validators/big.ak".to_string(),
                 source_span: None,
                 parameters: vec![ValidatorParameterContext {
@@ -1492,10 +1504,22 @@ mod tests {
             .collect::<Vec<_>>();
 
         let rendered = render_helper_context(&functions);
+        let body = rendered
+            .split("\n… (helper context truncated")
+            .next()
+            .expect("truncated body");
 
         assert!(rendered.contains("helper context truncated"));
         assert!(rendered.contains("use grep or read_file"));
         assert!(rendered.contains("- `validators/big.ak`"));
+        assert!(
+            body.len() <= MAX_HELPER_CONTEXT_CHARS,
+            "helper body exceeded its cap: {}",
+            body.len()
+        );
+        // The cut must land on a whole line, never mid-signature.
+        assert!(body.ends_with('\n'));
+        assert!(body.lines().last().unwrap().ends_with('`'));
     }
 
     #[test]
