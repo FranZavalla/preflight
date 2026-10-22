@@ -2,7 +2,7 @@ use miette::{Context, IntoDiagnostic, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -249,6 +249,7 @@ pub(super) struct AgentLoopContext<'a> {
     pub(super) permission_prompt: &'a PermissionPromptSpec,
     pub(super) provider_label: &'a str,
     pub(super) skill_timeout: Duration,
+    pub(super) max_agent_steps: usize,
 }
 
 pub(super) fn run_agent_loop<F>(
@@ -267,10 +268,12 @@ where
         permission_prompt,
         provider_label,
         skill_timeout,
+        max_agent_steps,
     } = context;
 
     let deadline = Instant::now() + skill_timeout;
-    let mut max_steps = MAX_AGENT_STEPS;
+    let interactive = io::stdin().is_terminal();
+    let mut max_steps = max_agent_steps;
     let mut step_idx = 0usize;
     let mut total_usage = TokenUsage::default();
     let mut malformed_replies = 0usize;
@@ -287,9 +290,12 @@ where
         }
 
         if step_idx >= max_steps {
-            if let Some(additional) =
-                prompt_for_additional_agent_steps(provider_label, &skill.id, max_steps)?
-            {
+            if let Some(additional) = prompt_for_additional_agent_steps(
+                provider_label,
+                &skill.id,
+                max_steps,
+                interactive,
+            )? {
                 max_steps = max_steps.saturating_add(additional);
                 log_agent_progress(
                     ai_logs,
@@ -302,7 +308,7 @@ where
             }
 
             return Err(miette::miette!(
-                "{} exceeded max interactive read steps ({}) for skill '{}' (enable --ai-logs to inspect progress)",
+                "{} exceeded max agent steps ({}) for skill '{}'; raise --max-agent-steps or run interactively to continue",
                 provider_label,
                 max_steps,
                 skill.id
@@ -484,7 +490,14 @@ fn prompt_for_additional_agent_steps(
     provider_label: &str,
     skill_id: &str,
     max_steps: usize,
+    interactive: bool,
 ) -> Result<Option<usize>> {
+    // Non-interactive runs must never block on stdin. Raise --max-agent-steps
+    // instead of prompting when there is no terminal to answer.
+    if !interactive {
+        return Ok(None);
+    }
+
     eprintln!(
         "[audit][agent] {} reached the current max steps ({}) for skill '{}'",
         provider_label, max_steps, skill_id
@@ -1888,7 +1901,16 @@ mod tests {
             permission_prompt: prompt,
             provider_label: "Test provider",
             skill_timeout: DEFAULT_SKILL_TIMEOUT,
+            max_agent_steps: MAX_AGENT_STEPS,
         }
+    }
+
+    #[test]
+    fn non_interactive_runs_do_not_prompt_for_more_steps() {
+        let result = prompt_for_additional_agent_steps("Test provider", "skill", 30, false)
+            .expect("non-interactive prompt should not fail");
+
+        assert!(result.is_none());
     }
 
     #[test]

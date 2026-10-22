@@ -23,6 +23,7 @@ pub struct OpenAiProvider {
     pub ai_logs: bool,
     pub reasoning_effort: Option<String>,
     pub ollama_compat: bool,
+    pub max_agent_steps: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1359,6 +1360,7 @@ impl AnalysisProvider for OpenAiProvider {
                 permission_prompt,
                 provider_label: "AI provider",
                 skill_timeout: super::shared::DEFAULT_SKILL_TIMEOUT,
+                max_agent_steps: self.max_agent_steps,
             },
             &mut messages,
             |messages| {

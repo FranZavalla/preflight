@@ -177,6 +177,7 @@ preflight [OPTIONS]
   --api-key-env <VAR>             Override the env var read for the API key.
   --reasoning-effort <LEVEL>      Reasoning effort hint. OpenAI/Ollama: low|medium|high. Anthropic: low|medium|high|max (max is Opus-tier only; rejected by Sonnet/Haiku).
   --ai-logs                       Print chat-style progress while auditing.
+  --max-agent-steps <N>           Maximum agent steps per skill.             [default: 30]
 
   --skills-dir <PATH>             Vulnerability skills directory.            [default: skills/vulnerabilities]
   --state-out <PATH>              Incremental state JSON path.               [default: .tx3/audit/state.json]

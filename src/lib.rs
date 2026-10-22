@@ -89,6 +89,10 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub ai_logs: bool,
 
+    /// Maximum agent steps per skill before stopping.
+    #[arg(long, default_value_t = 30)]
+    pub max_agent_steps: usize,
+
     /// Optional reasoning effort hint for OpenAI-compatible providers (e.g. low|medium|high).
     #[arg(long)]
     pub reasoning_effort: Option<String>,
