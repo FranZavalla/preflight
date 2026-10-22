@@ -113,11 +113,6 @@ pub struct Args {
     #[arg(long)]
     pub main_source: Option<String>,
 
-    /// Exclude source files whose relative path or file name matches this glob.
-    /// Repeatable; supports `*` and `?`.
-    #[arg(long)]
-    pub exclude: Vec<String>,
-
     /// Exclude `*.tests.ak` files from source discovery and the audit context.
     #[arg(long, default_value_t = false)]
     pub exclude_tests: bool,
@@ -134,14 +129,24 @@ fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
     let report_out = PathBuf::from(&args.report_out);
     let ast_out = PathBuf::from(&args.ast_out);
     let project_root = std::env::current_dir().into_diagnostic()?;
-    let mut exclude_patterns = args.exclude.clone();
-    if args.exclude_tests {
-        exclude_patterns.push("*.tests.ak".to_string());
-    }
+    let exclude_patterns = build_exclude_patterns(args.exclude_tests);
     let aiken_source_files = discover_source_files(&project_root, &exclude_patterns)?;
     let source_files = if aiken_source_files.is_empty() {
+        // `--main-source` is an explicit opt-in to a single file, so it still
+        // wins when excluding tests removed everything; warn so the override is
+        // not silent.
         if let Some(main_source) = &args.main_source {
+            if args.exclude_tests {
+                eprintln!(
+                    "⚠️  Excluding test files left no discovered sources; auditing --main-source {} instead.",
+                    main_source
+                );
+            }
             vec![PathBuf::from(main_source)]
+        } else if args.exclude_tests {
+            return Err(miette::miette!(
+                "No .ak source files left after excluding *.tests.ak; remove --exclude-tests or pass --main-source"
+            ));
         } else {
             return Err(miette::miette!(
                 "No .ak source files found and no --main-source specified"
@@ -180,6 +185,7 @@ fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
             .iter()
             .map(|path| path.display().to_string())
             .collect(),
+        excluded_patterns: exclude_patterns.clone(),
         provider: provider.provider_spec(),
         permission_prompt: permission_prompt.clone(),
         ast: Some(ast_context.metadata.clone()),
@@ -622,6 +628,16 @@ fn display_path_for_prompt(project_root: &Path, path: &Path) -> String {
         .unwrap_or_else(|_| path.display().to_string())
 }
 
+const TEST_SOURCE_GLOB: &str = "*.tests.ak";
+
+fn build_exclude_patterns(exclude_tests: bool) -> Vec<String> {
+    if exclude_tests {
+        vec![TEST_SOURCE_GLOB.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 fn discover_source_files(project_root: &Path, exclude_patterns: &[String]) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let mut to_visit = vec![project_root.to_path_buf()];
@@ -903,6 +919,13 @@ fn render_coverage_markdown(
         format_total_token_usage(&state.total_token_usage),
         format_duration_ms(state.total_duration_ms),
     ));
+
+    if !state.excluded_patterns.is_empty() {
+        coverage.push_str(&format!(
+            "\n- Excluded patterns: {}",
+            state.excluded_patterns.join(", ")
+        ));
+    }
 
     if ignored > 0 {
         coverage.push_str(&format!(
@@ -1301,27 +1324,26 @@ body
     }
 
     #[test]
-    fn discover_source_files_applies_exclude_patterns() {
+    fn discover_source_files_excludes_tests_when_pattern_applied() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path();
         let validators = root.join("validators");
-        let legacy = root.join("legacy");
 
         fs::create_dir_all(&validators).expect("create validators");
-        fs::create_dir_all(&legacy).expect("create legacy");
         fs::write(validators.join("spend.ak"), "validator spend {}").expect("write source");
         fs::write(validators.join("spend.tests.ak"), "test spend {}").expect("write test");
-        fs::write(legacy.join("old.ak"), "validator old {}").expect("write legacy");
 
-        let files = discover_source_files(root, &["*.tests.ak".to_string()])
+        let files = discover_source_files(root, &build_exclude_patterns(true))
             .expect("should discover files");
-        assert_eq!(files.len(), 2);
-        assert!(files.iter().all(|path| !path.ends_with("spend.tests.ak")));
 
-        let files = discover_source_files(root, &["legacy/*.ak".to_string()])
-            .expect("should discover files");
-        assert_eq!(files.len(), 2);
-        assert!(files.iter().all(|path| !path.ends_with("legacy/old.ak")));
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("validators/spend.ak"));
+    }
+
+    #[test]
+    fn build_exclude_patterns_maps_the_exclude_tests_flag() {
+        assert!(build_exclude_patterns(false).is_empty());
+        assert_eq!(build_exclude_patterns(true), vec!["*.tests.ak".to_string()]);
     }
 
     #[test]
@@ -1373,6 +1395,7 @@ body
         AnalysisStateJson {
             version: "2".to_string(),
             source_files: Vec::new(),
+            excluded_patterns: Vec::new(),
             provider: crate::model::ProviderSpec {
                 name: "test".to_string(),
                 model: None,
@@ -2203,6 +2226,20 @@ body
         let report = build_report(&state, &skills, false);
 
         assert!(!report.coverage_markdown.contains("Status: INCOMPLETE"));
+    }
+
+    #[test]
+    fn report_coverage_lists_excluded_patterns() {
+        let mut state = empty_state();
+        state.excluded_patterns = vec!["*.tests.ak".to_string()];
+
+        let report = build_report(&state, &[], false);
+
+        assert!(
+            report
+                .coverage_markdown
+                .contains("Excluded patterns: *.tests.ak")
+        );
     }
 
     #[test]
