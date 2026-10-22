@@ -1,7 +1,7 @@
 use miette::{Context, IntoDiagnostic, Result};
 use serde_json::{Value, json};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::AnalysisProvider;
 use super::shared::{
@@ -90,6 +90,21 @@ impl From<miette::Report> for AttemptFailure {
             kind: FailureKind::NextVariant,
             retry_after: None,
         }
+    }
+}
+
+fn transport_failure(error: reqwest::Error) -> AttemptFailure {
+    // A stalled read is unlikely to recover by resending the same payload;
+    // move on to the next variant instead of burning the skill budget on
+    // repeated timeouts. Connection resets remain retryable transients.
+    if error.is_timeout() {
+        AttemptFailure {
+            report: miette::miette!("request timed out: {error}"),
+            kind: FailureKind::NextVariant,
+            retry_after: None,
+        }
+    } else {
+        AttemptFailure::transient(miette::miette!("request failed: {error}"))
     }
 }
 
@@ -461,6 +476,7 @@ async fn attempt_with_backoff<'a, F, Fut>(
     label: &str,
     attempt_idx: usize,
     budget: &mut RetryBudget,
+    deadline: Instant,
     run: F,
 ) -> std::result::Result<(String, TokenUsage), AttemptFailure>
 where
@@ -479,6 +495,18 @@ where
         let Some(delay) = retry_delay_after_failure(&last, retry) else {
             return Err(last);
         };
+
+        if Instant::now() + delay >= deadline {
+            log_agent_progress(
+                ai_logs,
+                format!(
+                    "⏳ {} attempt {} hit the skill deadline; giving up",
+                    label,
+                    attempt_idx + 1
+                ),
+            );
+            return Err(last);
+        }
 
         if !budget.take(delay) {
             log_agent_progress(
@@ -527,8 +555,7 @@ async fn send_request(
         .json(payload)
         .send()
         .await
-        .into_diagnostic()
-        .map_err(AttemptFailure::transient)
+        .map_err(transport_failure)
 }
 
 /// Checks the HTTP status and preserves why the gateway refused, so the caller
@@ -544,11 +571,7 @@ async fn ensure_success(
         return Ok((response, retry_after));
     }
 
-    let body = response
-        .text()
-        .await
-        .into_diagnostic()
-        .map_err(AttemptFailure::transient)?;
+    let body = response.text().await.map_err(transport_failure)?;
     Err(classify_request_failure(label, status, &body, retry_after))
 }
 
@@ -1039,12 +1062,7 @@ async fn stream_chat_attempt(
     let mut usage = TokenUsage::default();
     let mut stream_error: Option<AttemptFailure> = None;
 
-    'stream: while let Some(chunk) = response
-        .chunk()
-        .await
-        .into_diagnostic()
-        .map_err(AttemptFailure::transient)?
-    {
+    'stream: while let Some(chunk) = response.chunk().await.map_err(transport_failure)? {
         pending.push_str(&String::from_utf8_lossy(&chunk));
 
         while let Some(newline_index) = pending.find('\n') {
@@ -1124,12 +1142,7 @@ async fn stream_responses_attempt(
     let mut usage = TokenUsage::default();
     let mut stream_error: Option<AttemptFailure> = None;
 
-    'stream: while let Some(chunk) = response
-        .chunk()
-        .await
-        .into_diagnostic()
-        .map_err(AttemptFailure::transient)?
-    {
+    'stream: while let Some(chunk) = response.chunk().await.map_err(transport_failure)? {
         pending.push_str(&String::from_utf8_lossy(&chunk));
 
         while let Some(newline_index) = pending.find('\n') {
@@ -1206,11 +1219,7 @@ async fn non_stream_chat_attempt(
 ) -> std::result::Result<(String, TokenUsage), AttemptFailure> {
     let response = send_request(client, endpoint, api_key, payload).await?;
     let (response, retry_after_hint) = ensure_success(response, "Non-stream request").await?;
-    let response_json = response
-        .json::<Value>()
-        .await
-        .into_diagnostic()
-        .map_err(AttemptFailure::transient)?;
+    let response_json = response.json::<Value>().await.map_err(transport_failure)?;
 
     if let Some(failure) = classify_in_band_error(&response_json, retry_after_hint) {
         return Err(failure);
@@ -1254,11 +1263,7 @@ async fn non_stream_responses_attempt(
 ) -> std::result::Result<(String, TokenUsage), AttemptFailure> {
     let response = send_request(client, endpoint, api_key, payload).await?;
     let (response, retry_after_hint) = ensure_success(response, "Non-stream request").await?;
-    let response_json = response
-        .json::<Value>()
-        .await
-        .into_diagnostic()
-        .map_err(AttemptFailure::transient)?;
+    let response_json = response.json::<Value>().await.map_err(transport_failure)?;
 
     if let Some(failure) = classify_in_band_error(&response_json, retry_after_hint) {
         return Err(failure);
@@ -1343,6 +1348,8 @@ impl AnalysisProvider for OpenAiProvider {
             }),
         ];
 
+        let skill_deadline = Instant::now() + super::shared::DEFAULT_SKILL_TIMEOUT;
+
         run_agent_loop(
             skill,
             super::shared::AgentLoopContext {
@@ -1351,11 +1358,16 @@ impl AnalysisProvider for OpenAiProvider {
                 project_root: &canonical_root,
                 permission_prompt,
                 provider_label: "AI provider",
+                skill_timeout: super::shared::DEFAULT_SKILL_TIMEOUT,
             },
             &mut messages,
             |messages| {
                 block_on_runtime_aware(async {
-                    let client = reqwest::Client::new();
+                    let client = reqwest::Client::builder()
+                        .read_timeout(super::shared::DEFAULT_REQUEST_READ_TIMEOUT)
+                        .connect_timeout(super::shared::DEFAULT_REQUEST_CONNECT_TIMEOUT)
+                        .build()
+                        .into_diagnostic()?;
                     let reasoning_effort = self.reasoning_effort.as_deref();
                     let mut budget = RetryBudget::new(RATE_LIMIT_TOTAL_WAIT_BUDGET);
 
@@ -1383,6 +1395,7 @@ impl AnalysisProvider for OpenAiProvider {
                                 "Streaming",
                                 attempt_idx,
                                 &mut budget,
+                                skill_deadline,
                                 || {
                                     run_attempt(
                                         api_family,
@@ -1452,6 +1465,7 @@ impl AnalysisProvider for OpenAiProvider {
                             "Non-stream",
                             attempt_idx,
                             &mut budget,
+                            skill_deadline,
                             || {
                                 run_attempt(
                                     api_family,
@@ -1617,20 +1631,27 @@ mod tests {
         let attempts = AtomicUsize::new(0);
         let mut budget = RetryBudget::new(Duration::from_secs(120));
 
-        let result = attempt_with_backoff(false, "Test", 0, &mut budget, || {
-            let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
-            async move {
-                if attempt < 3 {
-                    Err(AttemptFailure {
-                        report: miette::miette!("429 Too Many Requests"),
-                        kind: FailureKind::RateLimited,
-                        retry_after: Some(Duration::ZERO),
-                    })
-                } else {
-                    Ok(("done".to_string(), TokenUsage::default()))
+        let result = attempt_with_backoff(
+            false,
+            "Test",
+            0,
+            &mut budget,
+            Instant::now() + Duration::from_secs(120),
+            || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                async move {
+                    if attempt < 3 {
+                        Err(AttemptFailure {
+                            report: miette::miette!("429 Too Many Requests"),
+                            kind: FailureKind::RateLimited,
+                            retry_after: Some(Duration::ZERO),
+                        })
+                    } else {
+                        Ok(("done".to_string(), TokenUsage::default()))
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("should recover after retries");
 
@@ -1643,20 +1664,50 @@ mod tests {
         let attempts = AtomicUsize::new(0);
         let mut budget = RetryBudget::new(Duration::from_secs(120));
 
-        let error = attempt_with_backoff(false, "Test", 0, &mut budget, || {
-            attempts.fetch_add(1, Ordering::SeqCst);
-            async {
-                Err(AttemptFailure {
-                    report: miette::miette!("credit balance is too low"),
-                    kind: FailureKind::Fatal,
-                    retry_after: None,
-                })
-            }
-        })
+        let error = attempt_with_backoff(
+            false,
+            "Test",
+            0,
+            &mut budget,
+            Instant::now() + Duration::from_secs(120),
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(AttemptFailure {
+                        report: miette::miette!("credit balance is too low"),
+                        kind: FailureKind::Fatal,
+                        retry_after: None,
+                    })
+                }
+            },
+        )
         .await
         .expect_err("fatal failures should stop immediately");
 
         assert!(error.report.to_string().contains("credit balance"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn skill_deadline_stops_retries() {
+        let attempts = AtomicUsize::new(0);
+        let mut budget = RetryBudget::new(Duration::from_secs(120));
+        let deadline = Instant::now() - Duration::from_secs(1);
+
+        let error = attempt_with_backoff(false, "Test", 0, &mut budget, deadline, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err(AttemptFailure {
+                    report: miette::miette!("429 Too Many Requests"),
+                    kind: FailureKind::RateLimited,
+                    retry_after: Some(Duration::ZERO),
+                })
+            }
+        })
+        .await
+        .expect_err("the skill deadline should stop retries");
+
+        assert!(error.report.to_string().contains("429"));
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
@@ -1675,16 +1726,23 @@ mod tests {
         let first_attempts = AtomicUsize::new(0);
 
         // Two 60s waits consume the whole turn budget.
-        let first = attempt_with_backoff(false, "Variant 1", 0, &mut budget, || {
-            first_attempts.fetch_add(1, Ordering::SeqCst);
-            async {
-                Err(AttemptFailure {
-                    report: miette::miette!("429 Too Many Requests"),
-                    kind: FailureKind::RateLimited,
-                    retry_after: Some(Duration::from_secs(60)),
-                })
-            }
-        })
+        let first = attempt_with_backoff(
+            false,
+            "Variant 1",
+            0,
+            &mut budget,
+            Instant::now() + Duration::from_secs(120),
+            || {
+                first_attempts.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(AttemptFailure {
+                        report: miette::miette!("429 Too Many Requests"),
+                        kind: FailureKind::RateLimited,
+                        retry_after: Some(Duration::from_secs(60)),
+                    })
+                }
+            },
+        )
         .await;
 
         assert!(first.is_err());
@@ -1694,16 +1752,23 @@ mod tests {
         );
 
         let second_attempts = AtomicUsize::new(0);
-        let second = attempt_with_backoff(false, "Variant 2", 0, &mut budget, || {
-            second_attempts.fetch_add(1, Ordering::SeqCst);
-            async {
-                Err(AttemptFailure {
-                    report: miette::miette!("429 Too Many Requests"),
-                    kind: FailureKind::RateLimited,
-                    retry_after: Some(Duration::from_secs(10)),
-                })
-            }
-        })
+        let second = attempt_with_backoff(
+            false,
+            "Variant 2",
+            0,
+            &mut budget,
+            Instant::now() + Duration::from_secs(120),
+            || {
+                second_attempts.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(AttemptFailure {
+                        report: miette::miette!("429 Too Many Requests"),
+                        kind: FailureKind::RateLimited,
+                        retry_after: Some(Duration::from_secs(10)),
+                    })
+                }
+            },
+        )
         .await;
 
         assert!(second.is_err());

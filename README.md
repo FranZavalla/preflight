@@ -42,6 +42,8 @@ By default the tool writes:
 | `.tx3/audit/vulnerabilities.md` | Final markdown report. |
 | `.tx3/audit/aiken-ast.json` | Cached AST snapshot. |
 
+Runs are bounded: each skill has a 10-minute wall-clock budget, and model reads time out after 120 seconds without data. Failures record the reason in state and in the report.
+
 ### Providers
 
 Select with `--provider`:
