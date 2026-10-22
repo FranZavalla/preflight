@@ -14,7 +14,9 @@ use crate::model::{
     ValidatorContextMap, VulnerabilityFinding, VulnerabilitySkill,
 };
 
-pub(super) const MAX_AGENT_STEPS: usize = 30;
+/// Default per-skill agent step cap, shared by the CLI default and the
+/// interactive "how many more steps" default.
+pub(crate) const DEFAULT_MAX_AGENT_STEPS: usize = 30;
 /// Maximum time one skill may spend before it is abandoned.
 pub(crate) const DEFAULT_SKILL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Maximum time to wait for a read from the model endpoint.
@@ -252,6 +254,21 @@ pub(super) struct AgentLoopContext<'a> {
     pub(super) max_agent_steps: usize,
 }
 
+/// The user declined to keep iterating; the whole audit must stop rather than
+/// moving on to the next skill.
+#[derive(Debug)]
+pub(crate) struct UserStopped;
+
+impl std::fmt::Display for UserStopped {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("audit stopped by user at the agent step limit")
+    }
+}
+
+impl std::error::Error for UserStopped {}
+
+impl miette::Diagnostic for UserStopped {}
+
 pub(super) fn run_agent_loop<F>(
     skill: &VulnerabilitySkill,
     context: AgentLoopContext<'_>,
@@ -307,8 +324,12 @@ where
                 continue;
             }
 
+            if interactive {
+                return Err(miette::Report::new(UserStopped));
+            }
+
             return Err(miette::miette!(
-                "{} exceeded max agent steps ({}) for skill '{}'; raise --max-agent-steps or run interactively to continue",
+                "{} exceeded max agent steps ({}) for skill '{}'; raise --max-agent-steps to continue",
                 provider_label,
                 max_steps,
                 skill.id
@@ -439,7 +460,7 @@ where
                         "Model completed skill '{}' at step {}/{} • status={} • findings={} • tokens=({})",
                         skill.id,
                         step_idx + 1,
-                        MAX_AGENT_STEPS,
+                        max_steps,
                         status,
                         findings,
                         format_token_usage_inline(&total_usage)
@@ -506,28 +527,38 @@ fn prompt_for_additional_agent_steps(
     io::stderr().flush().into_diagnostic()?;
 
     let mut answer = String::new();
-    io::stdin().read_line(&mut answer).into_diagnostic()?;
+    if io::stdin().read_line(&mut answer).into_diagnostic()? == 0 {
+        return Ok(None);
+    }
+
     let accepted = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
     if !accepted {
         return Ok(None);
     }
 
-    eprint!("How many additional steps? [default {}]: ", MAX_AGENT_STEPS);
+    eprint!("How many additional steps? [default {}]: ", max_steps);
     io::stderr().flush().into_diagnostic()?;
 
     let mut additional = String::new();
-    io::stdin().read_line(&mut additional).into_diagnostic()?;
-    let additional = additional.trim();
+    if io::stdin().read_line(&mut additional).into_diagnostic()? == 0 {
+        return Ok(None);
+    }
 
-    let parsed = if additional.is_empty() {
-        Some(MAX_AGENT_STEPS)
-    } else {
-        additional.parse::<usize>().ok()
-    };
+    Ok(additional_steps_from_answer(&additional, max_steps))
+}
 
-    match parsed {
-        Some(0) | None => Ok(None),
-        Some(value) => Ok(Some(value)),
+/// Empty input means "use the effective cap again". Zero or unparseable input
+/// means the user declined, which stops the whole audit.
+fn additional_steps_from_answer(answer: &str, max_steps: usize) -> Option<usize> {
+    let answer = answer.trim();
+
+    if answer.is_empty() {
+        return Some(max_steps);
+    }
+
+    match answer.parse::<usize>() {
+        Ok(0) | Err(_) => None,
+        Ok(value) => Some(value),
     }
 }
 
@@ -1901,8 +1932,17 @@ mod tests {
             permission_prompt: prompt,
             provider_label: "Test provider",
             skill_timeout: DEFAULT_SKILL_TIMEOUT,
-            max_agent_steps: MAX_AGENT_STEPS,
+            max_agent_steps: DEFAULT_MAX_AGENT_STEPS,
         }
+    }
+
+    #[test]
+    fn additional_steps_default_to_effective_cap() {
+        assert_eq!(additional_steps_from_answer("", 7), Some(7));
+        assert_eq!(additional_steps_from_answer(" \n", 60), Some(60));
+        assert_eq!(additional_steps_from_answer("5\n", 7), Some(5));
+        assert_eq!(additional_steps_from_answer("0", 7), None);
+        assert_eq!(additional_steps_from_answer("not-a-number", 7), None);
     }
 
     #[test]

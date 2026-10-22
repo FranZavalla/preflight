@@ -193,6 +193,8 @@ preflight [OPTIONS]
   --exclude-tests                 Exclude *.tests.ak files from source discovery.
 ```
 
+When the step cap is reached interactively, declining to add steps stops the whole audit. Non-interactive runs fail that skill with a message to raise `--max-agent-steps`.
+
 ## Releases
 
 Releases are produced via [`cargo-dist`](https://github.com/axodotdev/cargo-dist). The `Release` GitHub Action triggers on tag pushes matching `v*.*.*` and builds binaries for:

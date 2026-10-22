@@ -14,7 +14,7 @@ use self::model::{
     SkillIterationResult, ValidatorContextMap, VulnerabilityFinding, VulnerabilityReportSpec,
     VulnerabilitySkill,
 };
-use self::providers::shared::{glob_match, is_ignored_path};
+use self::providers::shared::{UserStopped, glob_match, is_ignored_path};
 use self::providers::{AnalysisProvider, build_provider};
 
 const DEFAULT_SKILLS_DIR: &str = "skills/vulnerabilities";
@@ -90,7 +90,7 @@ pub struct Args {
     pub ai_logs: bool,
 
     /// Maximum agent steps per skill before stopping.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = crate::providers::shared::DEFAULT_MAX_AGENT_STEPS)]
     pub max_agent_steps: usize,
 
     /// Optional reasoning effort hint for OpenAI-compatible providers (e.g. low|medium|high).
@@ -352,19 +352,34 @@ fn run_skill_loop(
             // carry on -- a rate limit that blocks skill 4 has usually cleared by
             // the time skill 9 comes around.
             Err(error) => {
-                consecutive_failures = consecutive_failures.saturating_add(1);
+                let user_stopped = error.downcast_ref::<UserStopped>().is_some();
+
+                if !user_stopped {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                }
+
                 let error_text = truncate_error_text(&error.to_string());
 
                 log_audit_progress(
                     context.ai_logs,
-                    format!(
-                        "Skill {}/{} • FAILED '{}' ({} in a row): {}",
-                        skill_idx + 1,
-                        total_skills,
-                        skill.id,
-                        consecutive_failures,
-                        error
-                    ),
+                    if user_stopped {
+                        format!(
+                            "Skill {}/{} • STOPPED '{}' by user: {}",
+                            skill_idx + 1,
+                            total_skills,
+                            skill.id,
+                            error
+                        )
+                    } else {
+                        format!(
+                            "Skill {}/{} • FAILED '{}' ({} in a row): {}",
+                            skill_idx + 1,
+                            total_skills,
+                            skill.id,
+                            consecutive_failures,
+                            error
+                        )
+                    },
                 );
 
                 let failed = SkillIterationResult {
@@ -385,6 +400,13 @@ fn run_skill_loop(
                 upsert_iteration(state, failed);
                 update_total_duration(state);
                 write_state(context.state_out, state)?;
+
+                if user_stopped {
+                    return Err(error).wrap_err(format!(
+                        "Stopping: audit stopped by user at the agent step limit; {} remaining skill(s) were not attempted",
+                        total_skills.saturating_sub(skill_idx + 1)
+                    ));
+                }
 
                 if consecutive_failures >= MAX_CONSECUTIVE_SKILL_FAILURES {
                     return Err(error).wrap_err(format!(
@@ -1590,6 +1612,72 @@ body
             state.iterations.len(),
             MAX_CONSECUTIVE_SKILL_FAILURES,
             "the aborting failure must still be recorded"
+        );
+    }
+
+    #[test]
+    fn skill_loop_stops_entire_audit_when_user_declines_more_steps() {
+        struct StoppedProvider {
+            calls: std::cell::RefCell<usize>,
+        }
+
+        impl AnalysisProvider for StoppedProvider {
+            fn provider_spec(&self) -> crate::model::ProviderSpec {
+                crate::model::ProviderSpec {
+                    name: "test".to_string(),
+                    model: None,
+                    notes: String::new(),
+                }
+            }
+
+            fn analyze_skill(
+                &self,
+                _skill: &VulnerabilitySkill,
+                _prompt: &MiniPrompt,
+                _source_references: &[String],
+                _validator_context: &ValidatorContextMap,
+                _project_root: &Path,
+                _permission_prompt: &PermissionPromptSpec,
+            ) -> Result<SkillIterationResult> {
+                *self.calls.borrow_mut() += 1;
+                Err(miette::Report::new(UserStopped))
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_out = temp.path().join("state.json");
+        let skills: Vec<VulnerabilitySkill> =
+            ["a", "b", "c"].iter().map(|id| skill_named(id)).collect();
+        let mut state = empty_state();
+        let provider = StoppedProvider {
+            calls: std::cell::RefCell::new(0),
+        };
+
+        let error = run_skill_loop(
+            &skills,
+            &mut state,
+            SkillLoopContext {
+                provider: &provider,
+                source_files: &[],
+                validator_context: &ValidatorContextMap::default(),
+                project_root: temp.path(),
+                permission_prompt: &permission_spec(temp.path()),
+                ai_logs: false,
+                state_out: &state_out,
+                resume_strict: false,
+            },
+        )
+        .expect_err("declining more steps should stop the audit");
+
+        assert!(error.to_string().contains("stopped by user"));
+        assert_eq!(*provider.calls.borrow(), 1, "later skills must not run");
+        assert_eq!(state.iterations.len(), 1);
+        assert_eq!(state.iterations[0].status, "failed");
+        assert!(
+            state.iterations[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("stopped by user"))
         );
     }
 
