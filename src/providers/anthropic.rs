@@ -576,11 +576,16 @@ impl AnalysisProvider for AnthropicProvider {
                 project_root: &canonical_root,
                 permission_prompt,
                 provider_label: "Anthropic provider",
+                skill_timeout: super::shared::DEFAULT_SKILL_TIMEOUT,
             },
             &mut messages,
             |messages| {
                 block_on_runtime_aware(async {
-                    let client = reqwest::Client::new();
+                    let client = reqwest::Client::builder()
+                        .read_timeout(super::shared::DEFAULT_REQUEST_READ_TIMEOUT)
+                        .connect_timeout(super::shared::DEFAULT_REQUEST_CONNECT_TIMEOUT)
+                        .build()
+                        .into_diagnostic()?;
 
                     if self.ai_logs {
                         let mut last_stream_error: Option<String> = None;

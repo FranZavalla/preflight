@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 
 use crate::model::{
@@ -15,6 +15,12 @@ use crate::model::{
 };
 
 pub(super) const MAX_AGENT_STEPS: usize = 30;
+/// Maximum time one skill may spend before it is abandoned.
+pub(crate) const DEFAULT_SKILL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Maximum time to wait for a read from the model endpoint.
+pub(crate) const DEFAULT_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(120);
+/// Maximum time to establish a model connection.
+pub(crate) const DEFAULT_REQUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Consecutive unparseable replies tolerated before a skill is abandoned.
 const MAX_MALFORMED_REPLIES: usize = 3;
 const MALFORMED_REPLY_NUDGE: &str = "Your last message was not valid JSON. \
@@ -242,6 +248,7 @@ pub(super) struct AgentLoopContext<'a> {
     pub(super) project_root: &'a Path,
     pub(super) permission_prompt: &'a PermissionPromptSpec,
     pub(super) provider_label: &'a str,
+    pub(super) skill_timeout: Duration,
 }
 
 pub(super) fn run_agent_loop<F>(
@@ -259,14 +266,26 @@ where
         project_root,
         permission_prompt,
         provider_label,
+        skill_timeout,
     } = context;
 
+    let deadline = Instant::now() + skill_timeout;
     let mut max_steps = MAX_AGENT_STEPS;
     let mut step_idx = 0usize;
     let mut total_usage = TokenUsage::default();
     let mut malformed_replies = 0usize;
 
     loop {
+        if Instant::now() >= deadline {
+            return Err(miette::miette!(
+                "{} exceeded the {}s skill budget for '{}' after {} step(s)",
+                provider_label,
+                skill_timeout.as_secs(),
+                skill.id,
+                step_idx
+            ));
+        }
+
         if step_idx >= max_steps {
             if let Some(additional) =
                 prompt_for_additional_agent_steps(provider_label, &skill.id, max_steps)?
@@ -1868,7 +1887,33 @@ mod tests {
             project_root: root,
             permission_prompt: prompt,
             provider_label: "Test provider",
+            skill_timeout: DEFAULT_SKILL_TIMEOUT,
         }
+    }
+
+    #[test]
+    fn agent_loop_stops_when_skill_budget_is_exhausted() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let prompt = PermissionPromptSpec {
+            shell: "bash".to_string(),
+            allowed_commands: vec![],
+            scope_rules: vec![],
+            workspace_root: root.display().to_string(),
+            read_scope: "workspace".to_string(),
+            interactive_permissions: false,
+            allowed_paths: vec![],
+        };
+        let mut context = loop_context(&root, &prompt);
+        context.skill_timeout = Duration::ZERO;
+        let mut messages = Vec::new();
+
+        let error = run_agent_loop(&dummy_skill(), context, &mut messages, |_| {
+            panic!("model must not be called after the skill budget is exhausted");
+        })
+        .expect_err("zero budget should stop immediately");
+
+        assert!(error.to_string().contains("skill budget"));
     }
 
     #[test]

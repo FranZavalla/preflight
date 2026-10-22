@@ -1351,11 +1351,16 @@ impl AnalysisProvider for OpenAiProvider {
                 project_root: &canonical_root,
                 permission_prompt,
                 provider_label: "AI provider",
+                skill_timeout: super::shared::DEFAULT_SKILL_TIMEOUT,
             },
             &mut messages,
             |messages| {
                 block_on_runtime_aware(async {
-                    let client = reqwest::Client::new();
+                    let client = reqwest::Client::builder()
+                        .read_timeout(super::shared::DEFAULT_REQUEST_READ_TIMEOUT)
+                        .connect_timeout(super::shared::DEFAULT_REQUEST_CONNECT_TIMEOUT)
+                        .build()
+                        .into_diagnostic()?;
                     let reasoning_effort = self.reasoning_effort.as_deref();
                     let mut budget = RetryBudget::new(RATE_LIMIT_TOTAL_WAIT_BUDGET);
 
