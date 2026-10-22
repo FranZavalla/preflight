@@ -1629,6 +1629,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stalled_response_is_not_retried() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().expect("accept test request");
+            thread::sleep(Duration::from_millis(500));
+            drop(socket);
+        });
+
+        let client = reqwest::Client::builder()
+            .read_timeout(Duration::from_millis(100))
+            .build()
+            .expect("test client");
+
+        let failure = send_request(
+            &client,
+            &format!("http://{address}/"),
+            "test-key",
+            &json!({"model": "test"}),
+        )
+        .await
+        .expect_err("a stalled server should time out");
+
+        assert_eq!(failure.kind, FailureKind::NextVariant);
+        assert!(failure.report.to_string().contains("timed out"));
+        server.join().expect("server thread");
+    }
+
+    #[tokio::test]
     async fn retries_a_rate_limited_request_without_switching_variants() {
         let attempts = AtomicUsize::new(0);
         let mut budget = RetryBudget::new(Duration::from_secs(120));
