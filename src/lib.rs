@@ -5,10 +5,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 pub mod ast;
+pub mod logging;
 pub mod model;
 pub mod providers;
 
 use self::ast::{generate_ast_and_validator_context, sha256_hex};
+use self::logging::LogLevel;
 use self::model::{
     AnalysisStateJson, AstMetadata, MiniPrompt, PermissionPromptSpec, ProviderSpec,
     SkillIterationResult, ValidatorContextMap, VulnerabilityFinding, VulnerabilityReportSpec,
@@ -85,9 +87,22 @@ pub struct Args {
     #[arg(long)]
     pub api_key_env: Option<String>,
 
-    /// Print chat-style progress of model requests and local tool actions while auditing.
-    #[arg(long, default_value_t = false)]
-    pub ai_logs: bool,
+    /// Print chat-style progress while auditing.
+    ///
+    /// Pass the flag alone for one compact block per skill and one line per
+    /// step, or `--ai-logs=full` to see raw model output and reasoning.
+    #[arg(
+        long,
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "brief",
+        default_value_t = LogLevel::Off
+    )]
+    pub ai_logs: LogLevel,
+
+    /// Also write the progress log to this file, with timestamps.
+    #[arg(long)]
+    pub log_file: Option<PathBuf>,
 
     /// Maximum agent steps per skill before stopping.
     #[arg(long, default_value_t = crate::providers::shared::DEFAULT_MAX_AGENT_STEPS)]
@@ -128,6 +143,11 @@ pub fn run(args: Args) -> Result<()> {
 }
 
 fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
+    // A file log keeps a durable record without scrolling the terminal, so it
+    // runs alongside brief terminal output rather than replacing it.
+    let tee_terminal = args.log_file.is_none() || args.ai_logs.is_enabled();
+    logging::init(args.log_file.as_deref(), tee_terminal)?;
+
     let skills_dir = PathBuf::from(&args.skills_dir);
     let state_out = PathBuf::from(&args.state_out);
     let report_out = PathBuf::from(&args.report_out);
@@ -281,7 +301,7 @@ struct SkillLoopContext<'a> {
     permission_prompt: &'a PermissionPromptSpec,
     validator_context: &'a ValidatorContextMap,
     provider: &'a dyn AnalysisProvider,
-    ai_logs: bool,
+    ai_logs: LogLevel,
     state_out: &'a Path,
     resume_strict: bool,
 }
@@ -332,7 +352,7 @@ fn run_skill_loop(
         log_audit_progress(
             context.ai_logs,
             format!(
-                "Skill {}/{} • analyzing '{}' ({})",
+                "▶ {}/{} {} ({})",
                 skill_idx + 1,
                 total_skills,
                 skill.id,
@@ -464,7 +484,7 @@ fn record_iteration(
     log_audit_progress(
         context.ai_logs,
         format!(
-            "Skill '{}' finished • status={} • findings={} • tokens=({}) • state persisted",
+            "✔ {} {} findings={} tokens=({}) state saved",
             skill_id,
             status,
             findings_count,
@@ -644,9 +664,9 @@ fn format_total_token_usage(usage: &crate::model::TokenUsage) -> String {
     parts.join(", ")
 }
 
-fn log_audit_progress(enabled: bool, message: impl AsRef<str>) {
-    if enabled {
-        eprintln!("🧭 {}", message.as_ref());
+fn log_audit_progress(level: LogLevel, message: impl AsRef<str>) {
+    if level.is_enabled() {
+        logging::write_line("🧭 ", message.as_ref());
     }
 }
 
@@ -1585,7 +1605,7 @@ body
                 validator_context: &ValidatorContextMap::default(),
                 project_root: temp.path(),
                 permission_prompt: &permission_spec(temp.path()),
-                ai_logs: false,
+                ai_logs: LogLevel::Off,
                 state_out: &state_out,
                 resume_strict: false,
             },
@@ -1653,7 +1673,7 @@ body
                 validator_context: &ValidatorContextMap::default(),
                 project_root: temp.path(),
                 permission_prompt: &permission_spec(temp.path()),
-                ai_logs: false,
+                ai_logs: LogLevel::Off,
                 state_out: &state_out,
                 resume_strict: false,
             },
@@ -1715,7 +1735,7 @@ body
                 validator_context: &ValidatorContextMap::default(),
                 project_root: temp.path(),
                 permission_prompt: &permission_spec(temp.path()),
-                ai_logs: false,
+                ai_logs: LogLevel::Off,
                 state_out: &state_out,
                 resume_strict: false,
             },
@@ -1947,7 +1967,7 @@ body
                 validator_context: &ValidatorContextMap::default(),
                 project_root: temp.path(),
                 permission_prompt: &permission_spec(temp.path()),
-                ai_logs: false,
+                ai_logs: LogLevel::Off,
                 state_out: &state_out,
                 resume_strict: false,
             },
@@ -2018,7 +2038,7 @@ body
                 validator_context: &ValidatorContextMap::default(),
                 project_root: temp.path(),
                 permission_prompt: &permission_spec(temp.path()),
-                ai_logs: false,
+                ai_logs: LogLevel::Off,
                 state_out: &state_out,
                 resume_strict: false,
             },
@@ -2085,7 +2105,7 @@ body
                 validator_context: &ValidatorContextMap::default(),
                 project_root: temp.path(),
                 permission_prompt: &permission_spec(temp.path()),
-                ai_logs: false,
+                ai_logs: LogLevel::Off,
                 state_out: &state_out,
                 resume_strict: true,
             },
@@ -2151,7 +2171,7 @@ body
                 validator_context: &ValidatorContextMap::default(),
                 project_root: temp.path(),
                 permission_prompt: &permission_spec(temp.path()),
-                ai_logs: false,
+                ai_logs: LogLevel::Off,
                 state_out: &state_out,
                 resume_strict: true,
             },
@@ -2216,7 +2236,7 @@ body
                 validator_context: &ValidatorContextMap::default(),
                 project_root: temp.path(),
                 permission_prompt: &permission_spec(temp.path()),
-                ai_logs: false,
+                ai_logs: LogLevel::Off,
                 state_out: &state_out,
                 resume_strict: false,
             },
@@ -2266,7 +2286,7 @@ body
                 validator_context: &ValidatorContextMap::default(),
                 project_root: temp.path(),
                 permission_prompt: &permission_spec(temp.path()),
-                ai_logs: false,
+                ai_logs: LogLevel::Off,
                 state_out: &state_out,
                 resume_strict: false,
             },

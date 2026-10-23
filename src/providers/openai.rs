@@ -7,8 +7,8 @@ use super::AnalysisProvider;
 use super::shared::{
     ContentStreamState, ReasoningStreamState, block_on_runtime_aware, build_agent_system_prompt,
     build_initial_user_prompt, emit_reasoning_double_line_break, emit_reasoning_line_break,
-    finalize_content_stdout, finalize_reasoning_stdout, log_agent_progress, run_agent_loop,
-    stream_content_delta_to_stdout, stream_reasoning_delta_to_stdout,
+    finalize_content_stdout, finalize_reasoning_stdout, log_agent_progress, log_full,
+    run_agent_loop, stream_content_delta_to_stdout, stream_reasoning_delta_to_stdout,
 };
 use crate::model::{
     MiniPrompt, PermissionPromptSpec, ProviderSpec, SkillIterationResult, TokenUsage,
@@ -20,7 +20,7 @@ pub struct OpenAiProvider {
     pub endpoint: String,
     pub api_key: String,
     pub model: String,
-    pub ai_logs: bool,
+    pub ai_logs: crate::logging::LogLevel,
     pub reasoning_effort: Option<String>,
     pub ollama_compat: bool,
     pub max_agent_steps: usize,
@@ -473,7 +473,7 @@ fn retry_delay_after_failure(failure: &AttemptFailure, retry: usize) -> Option<D
 /// Runs one payload variant, waiting out retryable failures instead of falling
 /// through to a different variant or failing the skill.
 async fn attempt_with_backoff<'a, F, Fut>(
-    ai_logs: bool,
+    ai_logs: crate::logging::LogLevel,
     label: &str,
     attempt_idx: usize,
     budget: &mut RetryBudget,
@@ -583,7 +583,7 @@ async fn run_attempt(
     endpoint: &str,
     api_key: &str,
     payload: &Value,
-    ai_logs: bool,
+    ai_logs: crate::logging::LogLevel,
 ) -> std::result::Result<(String, TokenUsage), AttemptFailure> {
     match (api_family, stream) {
         (ApiFamily::ChatCompletions, true) => {
@@ -780,7 +780,7 @@ fn extract_summary_index(event: &Value) -> Option<i64> {
 }
 
 fn maybe_emit_reasoning_line_break_on_summary_change(
-    enabled: bool,
+    enabled: crate::logging::LogLevel,
     state: &mut ReasoningStreamState,
     summary_index: Option<i64>,
 ) {
@@ -1051,7 +1051,7 @@ async fn stream_chat_attempt(
     endpoint: &str,
     api_key: &str,
     payload: &Value,
-    ai_logs: bool,
+    ai_logs: crate::logging::LogLevel,
 ) -> std::result::Result<(String, TokenUsage), AttemptFailure> {
     let response = send_request(client, endpoint, api_key, payload).await?;
     let (mut response, retry_after_hint) = ensure_success(response, "Streaming request").await?;
@@ -1131,7 +1131,7 @@ async fn stream_responses_attempt(
     endpoint: &str,
     api_key: &str,
     payload: &Value,
-    ai_logs: bool,
+    ai_logs: crate::logging::LogLevel,
 ) -> std::result::Result<(String, TokenUsage), AttemptFailure> {
     let response = send_request(client, endpoint, api_key, payload).await?;
     let (mut response, retry_after_hint) = ensure_success(response, "Streaming request").await?;
@@ -1216,7 +1216,7 @@ async fn non_stream_chat_attempt(
     endpoint: &str,
     api_key: &str,
     payload: &Value,
-    ai_logs: bool,
+    ai_logs: crate::logging::LogLevel,
 ) -> std::result::Result<(String, TokenUsage), AttemptFailure> {
     let response = send_request(client, endpoint, api_key, payload).await?;
     let (response, retry_after_hint) = ensure_success(response, "Non-stream request").await?;
@@ -1245,9 +1245,9 @@ async fn non_stream_chat_attempt(
                 .and_then(Value::as_str)
         })
     {
-        log_agent_progress(
+        log_full(
             ai_logs,
-            format!("🧠 Model reasoning output:\n{}", &reasoning_text),
+            format!("model reasoning output:\n{}", &reasoning_text),
         );
     }
 
@@ -1260,7 +1260,7 @@ async fn non_stream_responses_attempt(
     endpoint: &str,
     api_key: &str,
     payload: &Value,
-    ai_logs: bool,
+    ai_logs: crate::logging::LogLevel,
 ) -> std::result::Result<(String, TokenUsage), AttemptFailure> {
     let response = send_request(client, endpoint, api_key, payload).await?;
     let (response, retry_after_hint) = ensure_success(response, "Non-stream request").await?;
@@ -1274,9 +1274,9 @@ async fn non_stream_responses_attempt(
         .ok_or_else(|| miette::miette!("AI provider returned an unexpected response payload"))?;
 
     if let Some(reasoning_summary) = extract_responses_reasoning_summary(&response_json) {
-        log_agent_progress(
+        log_full(
             ai_logs,
-            format!("🧠 Model reasoning summary:\n{}", &reasoning_summary),
+            format!("model reasoning summary:\n{}", &reasoning_summary),
         );
     }
 
@@ -1373,7 +1373,7 @@ impl AnalysisProvider for OpenAiProvider {
                     let reasoning_effort = self.reasoning_effort.as_deref();
                     let mut budget = RetryBudget::new(RATE_LIMIT_TOTAL_WAIT_BUDGET);
 
-                    if self.ai_logs {
+                    if self.ai_logs.is_full() {
                         let mut last_stream_error: Option<String> = None;
                         let stream_payloads = match api_family {
                             ApiFamily::ChatCompletions => build_chat_payload_variants(
@@ -1666,7 +1666,7 @@ mod tests {
         let mut budget = RetryBudget::new(Duration::from_secs(120));
 
         let result = attempt_with_backoff(
-            false,
+            crate::logging::LogLevel::Off,
             "Test",
             0,
             &mut budget,
@@ -1699,7 +1699,7 @@ mod tests {
         let mut budget = RetryBudget::new(Duration::from_secs(120));
 
         let error = attempt_with_backoff(
-            false,
+            crate::logging::LogLevel::Off,
             "Test",
             0,
             &mut budget,
@@ -1728,16 +1728,23 @@ mod tests {
         let mut budget = RetryBudget::new(Duration::from_secs(120));
         let deadline = Instant::now() - Duration::from_secs(1);
 
-        let error = attempt_with_backoff(false, "Test", 0, &mut budget, deadline, || {
-            attempts.fetch_add(1, Ordering::SeqCst);
-            async {
-                Err(AttemptFailure {
-                    report: miette::miette!("429 Too Many Requests"),
-                    kind: FailureKind::RateLimited,
-                    retry_after: Some(Duration::ZERO),
-                })
-            }
-        })
+        let error = attempt_with_backoff(
+            crate::logging::LogLevel::Off,
+            "Test",
+            0,
+            &mut budget,
+            deadline,
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(AttemptFailure {
+                        report: miette::miette!("429 Too Many Requests"),
+                        kind: FailureKind::RateLimited,
+                        retry_after: Some(Duration::ZERO),
+                    })
+                }
+            },
+        )
         .await
         .expect_err("the skill deadline should stop retries");
 
@@ -1761,7 +1768,7 @@ mod tests {
 
         // Two 60s waits consume the whole turn budget.
         let first = attempt_with_backoff(
-            false,
+            crate::logging::LogLevel::Off,
             "Variant 1",
             0,
             &mut budget,
@@ -1787,7 +1794,7 @@ mod tests {
 
         let second_attempts = AtomicUsize::new(0);
         let second = attempt_with_backoff(
-            false,
+            crate::logging::LogLevel::Off,
             "Variant 2",
             0,
             &mut budget,
