@@ -20,6 +20,8 @@ use self::providers::shared::{UserStopped, glob_match, is_ignored_path};
 use self::providers::{AnalysisProvider, build_provider};
 
 const DEFAULT_SKILLS_DIR: &str = "skills/vulnerabilities";
+/// Default destination for the timestamped progress log.
+const DEFAULT_LOG_FILE: &str = ".tx3/audit/preflight.log";
 
 /// Bumped when audit behavior changes without a binary version bump.
 const AUDIT_CONTEXT_VERSION: &str = "1";
@@ -101,8 +103,10 @@ pub struct Args {
     pub ai_logs: LogLevel,
 
     /// Also write the progress log to this file, with timestamps.
-    #[arg(long)]
-    pub log_file: Option<PathBuf>,
+    ///
+    /// Only written when `--ai-logs` is set. Pass an empty value to disable it.
+    #[arg(long, default_value = DEFAULT_LOG_FILE)]
+    pub log_file: PathBuf,
 
     /// Maximum agent steps per skill before stopping.
     #[arg(long, default_value_t = crate::providers::shared::DEFAULT_MAX_AGENT_STEPS)]
@@ -137,6 +141,23 @@ pub struct Args {
     pub exclude_tests: bool,
 }
 
+/// Decides whether this run opens a log file.
+///
+/// The default path is written only when `--ai-logs` is on, so a silent run does
+/// not create an empty file. A path the user named explicitly, or an empty path
+/// used to opt out, is always honoured.
+fn resolve_log_file(log_file: &Path, ai_logs: LogLevel) -> Option<PathBuf> {
+    if log_file.as_os_str().is_empty() {
+        return None;
+    }
+
+    if ai_logs.is_enabled() || log_file != Path::new(DEFAULT_LOG_FILE) {
+        return Some(log_file.to_path_buf());
+    }
+
+    None
+}
+
 pub fn run(args: Args) -> Result<()> {
     let provider = build_provider(&args)?;
     run_analysis(args, provider.as_ref())
@@ -145,8 +166,11 @@ pub fn run(args: Args) -> Result<()> {
 fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
     // A file log keeps a durable record without scrolling the terminal, so it
     // runs alongside brief terminal output rather than replacing it.
-    let tee_terminal = args.log_file.is_none() || args.ai_logs.is_enabled();
-    logging::init(args.log_file.as_deref(), tee_terminal)?;
+    // The default path is only opened when logging is on, so a silent run
+    // leaves no empty log behind. An explicitly named file is always written.
+    let log_file = resolve_log_file(&args.log_file, args.ai_logs);
+    let tee_terminal = args.ai_logs.is_enabled();
+    logging::init(log_file.as_deref(), tee_terminal)?;
 
     let skills_dir = PathBuf::from(&args.skills_dir);
     let state_out = PathBuf::from(&args.state_out);
@@ -1312,6 +1336,28 @@ fn render_findings_markdown(findings: &[VulnerabilityFinding]) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn log_file_default_only_applies_when_logging_is_on() {
+        let default = Path::new(DEFAULT_LOG_FILE);
+        let custom = Path::new("/tmp/custom.log");
+
+        assert_eq!(resolve_log_file(default, LogLevel::Off), None);
+        assert_eq!(
+            resolve_log_file(default, LogLevel::Brief),
+            Some(default.to_path_buf())
+        );
+        assert_eq!(
+            resolve_log_file(custom, LogLevel::Off),
+            Some(custom.to_path_buf()),
+            "an explicitly named file is always written"
+        );
+        assert_eq!(
+            resolve_log_file(Path::new(""), LogLevel::Full),
+            None,
+            "an empty path opts out"
+        );
+    }
 
     #[test]
     fn parse_skill_content_reads_frontmatter_and_guidance() {
