@@ -120,11 +120,11 @@ pub(super) struct ContentStreamState {
 }
 
 pub(super) fn stream_reasoning_delta_to_stdout(
-    enabled: bool,
+    enabled: crate::logging::LogLevel,
     state: &mut ReasoningStreamState,
     delta: &str,
 ) {
-    if !enabled || delta.is_empty() {
+    if !enabled.is_full() || delta.is_empty() {
         return;
     }
 
@@ -140,8 +140,11 @@ pub(super) fn stream_reasoning_delta_to_stdout(
     state.line_break_emitted = false;
 }
 
-pub(super) fn emit_reasoning_line_break(enabled: bool, state: &mut ReasoningStreamState) {
-    if !enabled || !state.started || state.line_break_emitted {
+pub(super) fn emit_reasoning_line_break(
+    enabled: crate::logging::LogLevel,
+    state: &mut ReasoningStreamState,
+) {
+    if !enabled.is_full() || !state.started || state.line_break_emitted {
         return;
     }
 
@@ -151,8 +154,11 @@ pub(super) fn emit_reasoning_line_break(enabled: bool, state: &mut ReasoningStre
     state.line_break_emitted = true;
 }
 
-pub(super) fn emit_reasoning_double_line_break(enabled: bool, state: &mut ReasoningStreamState) {
-    if !enabled || !state.started || state.line_break_emitted {
+pub(super) fn emit_reasoning_double_line_break(
+    enabled: crate::logging::LogLevel,
+    state: &mut ReasoningStreamState,
+) {
+    if !enabled.is_full() || !state.started || state.line_break_emitted {
         return;
     }
 
@@ -162,16 +168,19 @@ pub(super) fn emit_reasoning_double_line_break(enabled: bool, state: &mut Reason
     state.line_break_emitted = true;
 }
 
-pub(super) fn finalize_reasoning_stdout(enabled: bool, state: &mut ReasoningStreamState) {
+pub(super) fn finalize_reasoning_stdout(
+    enabled: crate::logging::LogLevel,
+    state: &mut ReasoningStreamState,
+) {
     emit_reasoning_line_break(enabled, state);
 }
 
 pub(super) fn stream_content_delta_to_stdout(
-    enabled: bool,
+    enabled: crate::logging::LogLevel,
     state: &mut ContentStreamState,
     delta: &str,
 ) {
-    if !enabled || delta.is_empty() {
+    if !enabled.is_full() || delta.is_empty() {
         return;
     }
 
@@ -189,8 +198,11 @@ pub(super) fn stream_content_delta_to_stdout(
     state.ends_with_newline = delta.ends_with('\n');
 }
 
-pub(super) fn finalize_content_stdout(enabled: bool, state: &mut ContentStreamState) {
-    if !enabled || !state.started || state.ends_with_newline {
+pub(super) fn finalize_content_stdout(
+    enabled: crate::logging::LogLevel,
+    state: &mut ContentStreamState,
+) {
+    if !enabled.is_full() || !state.started || state.ends_with_newline {
         return;
     }
 
@@ -246,7 +258,7 @@ pub(super) fn build_tool_result_user_prompt(request: &ReadRequest, output: &str)
 
 pub(super) struct AgentLoopContext<'a> {
     pub(super) endpoint: &'a str,
-    pub(super) ai_logs: bool,
+    pub(super) ai_logs: crate::logging::LogLevel,
     pub(super) project_root: &'a Path,
     pub(super) permission_prompt: &'a PermissionPromptSpec,
     pub(super) provider_label: &'a str,
@@ -336,10 +348,10 @@ where
             ));
         }
 
-        log_agent_progress(
+        log_full(
             ai_logs,
             format!(
-                "Step {}/{} • requesting next action for skill '{}' ({})",
+                "step {}/{}, requesting '{}' from {}",
                 step_idx + 1,
                 max_steps,
                 skill.id,
@@ -347,26 +359,20 @@ where
             ),
         );
 
-        log_agent_progress(
-            ai_logs,
-            format!(
-                "🤔 Thinking… waiting for model response (step {}/{}, skill='{}')",
-                step_idx + 1,
-                max_steps,
-                skill.id
-            ),
-        );
-
-        let request_started_at = Instant::now();
+        // Timed before the request so the brief line covers both the model
+        // latency and the local tool call, which is what a slow step costs.
+        let step_started_at = Instant::now();
         let response_result = request_model(messages.as_slice());
-        let elapsed = request_started_at.elapsed();
+        let elapsed = step_started_at.elapsed();
 
         if let Err(error) = &response_result {
             log_agent_progress(
                 ai_logs,
                 format!(
-                    "❌ Model request failed after {} ms: {}",
-                    elapsed.as_millis(),
+                    "step {}/{} failed after {}: {}",
+                    step_idx + 1,
+                    max_steps,
+                    crate::logging::format_duration(elapsed),
                     error
                 ),
             );
@@ -375,28 +381,14 @@ where
         let (content, step_usage) = response_result?;
         total_usage.add(&step_usage);
 
-        if !step_usage.is_empty() {
-            log_agent_progress(
-                ai_logs,
-                format!(
-                    "✅ Model response received in {} ms ({})",
-                    elapsed.as_millis(),
-                    format_token_usage_inline(&step_usage)
-                ),
-            );
-        } else {
-            log_agent_progress(
-                ai_logs,
-                format!("✅ Model response received in {} ms", elapsed.as_millis()),
-            );
-        }
-
+        // The brief line is completed after the action is known, so one line per
+        // step carries the timing, the action and the bytes it read.
         messages.push(json!({
             "role": "assistant",
             "content": content,
         }));
 
-        log_agent_progress(ai_logs, format!("Model output:\n{}", &content));
+        log_full(ai_logs, format!("model output:\n{}", &content));
 
         let action = match parse_agent_action(&content) {
             Ok(action) => {
@@ -419,8 +411,12 @@ where
                 log_agent_progress(
                     ai_logs,
                     format!(
-                        "⚠️ Unparseable reply ({}/{}), asking the model to retry: {}",
-                        malformed_replies, MAX_MALFORMED_REPLIES, error
+                        "step {}/{} unparseable reply ({}/{}), asking the model to retry: {}",
+                        step_idx + 1,
+                        max_steps,
+                        malformed_replies,
+                        MAX_MALFORMED_REPLIES,
+                        error
                     ),
                 );
 
@@ -451,17 +447,29 @@ where
                     .filter(|value| !value.trim().is_empty());
 
                 if let Some(summary) = analysis_summary {
-                    log_agent_progress(ai_logs, format!("Model analysis summary:\n{}", summary));
+                    log_full(ai_logs, format!("analysis summary:\n{}", summary));
                 }
+
+                log_step(
+                    ai_logs,
+                    format!(
+                        "step {}/{}  final              status={} findings={}  {}{}",
+                        step_idx + 1,
+                        max_steps,
+                        status,
+                        findings,
+                        crate::logging::format_duration(step_started_at.elapsed()),
+                        format_usage_suffix(&step_usage)
+                    ),
+                );
 
                 log_agent_progress(
                     ai_logs,
                     format!(
-                        "Model completed skill '{}' at step {}/{} • status={} • findings={} • tokens=({})",
+                        "{} completed at step {}/{}, findings={}, tokens=({})",
                         skill.id,
                         step_idx + 1,
                         max_steps,
-                        status,
                         findings,
                         format_token_usage_inline(&total_usage)
                     ),
@@ -470,31 +478,34 @@ where
                 return Ok(iteration_from_parsed(skill, parsed, total_usage));
             }
             AgentAction::ReadRequest(request) => {
-                log_agent_progress(
+                log_full(
                     ai_logs,
-                    format!(
-                        "Model requested: {}",
-                        describe_read_request_friendly(&request)
-                    ),
-                );
-
-                log_agent_progress(
-                    ai_logs,
-                    format!("Running local action: {}", summarize_read_request(&request)),
+                    format!("running {}", describe_read_request_friendly(&request)),
                 );
 
                 let output = execute_read_request(&request, project_root, permission_prompt)
                     .unwrap_or_else(|error| format!("Request failed: {}", error));
 
-                log_agent_progress(
+                log_full(
                     ai_logs,
                     format!(
-                        "Tool output:\n{}",
+                        "tool output:\n{}",
                         render_tool_output_for_log(&request, &output)
                     ),
                 );
 
-                log_agent_progress(ai_logs, "Sending tool output back to model");
+                log_step(
+                    ai_logs,
+                    format!(
+                        "step {}/{}  {:<32} {:>8}  {}{}",
+                        step_idx + 1,
+                        max_steps,
+                        truncate_action(&summarize_read_request(&request)),
+                        crate::logging::format_bytes(output.len()),
+                        crate::logging::format_duration(step_started_at.elapsed()),
+                        format_usage_suffix(&step_usage)
+                    ),
+                );
 
                 messages.push(json!({
                     "role": "user",
@@ -1278,10 +1289,46 @@ pub(super) fn render_tool_output_for_log(request: &ReadRequest, output: &str) ->
     }
 }
 
-pub(super) fn log_agent_progress(enabled: bool, message: impl AsRef<str>) {
-    if enabled {
-        eprintln!("🤖 {}", message.as_ref());
+pub(super) fn log_agent_progress(level: crate::logging::LogLevel, message: impl AsRef<str>) {
+    if level.is_enabled() {
+        crate::logging::write_line("🤖 ", message.as_ref());
     }
+}
+
+/// Progress a short audit can show for every step, without the raw payload.
+pub(super) fn log_step(level: crate::logging::LogLevel, message: impl AsRef<str>) {
+    if level.is_enabled() {
+        crate::logging::write_line("  ", message.as_ref());
+    }
+}
+
+/// Diagnostic detail: request lines, analysis summaries and raw model or tool
+/// payloads. Only the `full` level prints these.
+pub(super) fn log_full(level: crate::logging::LogLevel, message: impl AsRef<str>) {
+    if level.is_full() {
+        crate::logging::write_line("🤖 ", message.as_ref());
+    }
+}
+
+fn format_usage_suffix(usage: &TokenUsage) -> String {
+    if usage.is_empty() {
+        String::new()
+    } else {
+        format!("  ({})", format_token_usage_inline(usage))
+    }
+}
+
+/// Keeps one action within a fixed column so brief logs stay scannable.
+fn truncate_action(action: &str) -> String {
+    const WIDTH: usize = 32;
+
+    if action.chars().count() <= WIDTH {
+        return action.to_string();
+    }
+
+    let mut shortened = action.chars().take(WIDTH - 1).collect::<String>();
+    shortened.push('…');
+    shortened
 }
 
 pub(super) fn iteration_from_parsed(
@@ -1930,13 +1977,31 @@ mod tests {
     fn loop_context<'a>(root: &'a Path, prompt: &'a PermissionPromptSpec) -> AgentLoopContext<'a> {
         AgentLoopContext {
             endpoint: "test://endpoint",
-            ai_logs: false,
+            ai_logs: crate::logging::LogLevel::Off,
             project_root: root,
             permission_prompt: prompt,
             provider_label: "Test provider",
             skill_timeout: DEFAULT_SKILL_TIMEOUT,
             max_agent_steps: DEFAULT_MAX_AGENT_STEPS,
         }
+    }
+
+    #[test]
+    fn brief_step_lines_stay_scannable() {
+        let line = format!(
+            "step {}/{}  {:<32} {:>8}  {}{}",
+            3,
+            30,
+            truncate_action("read_file lib/very/long/path/to/some/validator.ak"),
+            crate::logging::format_bytes(20480),
+            crate::logging::format_duration(Duration::from_millis(9100)),
+            format_usage_suffix(&TokenUsage::default())
+        );
+
+        assert!(line.starts_with("step 3/30  read_file lib/very/long/path/to…"));
+        assert!(line.contains("20.0 KB"));
+        assert!(line.contains("9.1s"));
+        assert_eq!(truncate_action("grep"), "grep");
     }
 
     #[test]

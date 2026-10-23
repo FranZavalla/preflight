@@ -6,8 +6,8 @@ use super::AnalysisProvider;
 use super::shared::{
     ContentStreamState, ReasoningStreamState, block_on_runtime_aware, build_agent_system_prompt,
     build_initial_user_prompt, emit_reasoning_double_line_break, emit_reasoning_line_break,
-    finalize_content_stdout, finalize_reasoning_stdout, log_agent_progress, run_agent_loop,
-    stream_content_delta_to_stdout, stream_reasoning_delta_to_stdout,
+    finalize_content_stdout, finalize_reasoning_stdout, log_agent_progress, log_full,
+    run_agent_loop, stream_content_delta_to_stdout, stream_reasoning_delta_to_stdout,
 };
 use crate::model::{
     MiniPrompt, PermissionPromptSpec, ProviderSpec, SkillIterationResult, TokenUsage,
@@ -25,7 +25,7 @@ pub struct AnthropicProvider {
     pub api_key: String,
     pub model: String,
     pub version: String,
-    pub ai_logs: bool,
+    pub ai_logs: crate::logging::LogLevel,
     pub reasoning_effort: Option<String>,
     pub max_agent_steps: usize,
 }
@@ -153,7 +153,7 @@ fn normalize_anthropic_message_content(content: Option<&Value>) -> Value {
 }
 
 fn maybe_emit_reasoning_line_break_on_summary_change(
-    enabled: bool,
+    enabled: crate::logging::LogLevel,
     state: &mut ReasoningStreamState,
     summary_index: Option<i64>,
 ) {
@@ -400,7 +400,7 @@ async fn stream_attempt(
     api_key: &str,
     version: &str,
     payload: &Value,
-    ai_logs: bool,
+    ai_logs: crate::logging::LogLevel,
 ) -> Result<(String, TokenUsage)> {
     let mut response = client
         .post(endpoint)
@@ -490,7 +490,7 @@ async fn non_stream_attempt(
     api_key: &str,
     version: &str,
     payload: &Value,
-    ai_logs: bool,
+    ai_logs: crate::logging::LogLevel,
 ) -> Result<(String, TokenUsage)> {
     let response = client
         .post(endpoint)
@@ -518,9 +518,9 @@ async fn non_stream_attempt(
     })?;
 
     if let Some(reasoning_text) = extract_anthropic_non_stream_reasoning(&response_json) {
-        log_agent_progress(
+        log_full(
             ai_logs,
-            format!("🧠 Model reasoning output:\n{}", reasoning_text),
+            format!("model reasoning output:\n{}", reasoning_text),
         );
     }
 
@@ -589,7 +589,7 @@ impl AnalysisProvider for AnthropicProvider {
                         .build()
                         .into_diagnostic()?;
 
-                    if self.ai_logs {
+                    if self.ai_logs.is_full() {
                         let mut last_stream_error: Option<String> = None;
                         let stream_payloads = build_anthropic_payload_variants(
                             &self.model,
@@ -695,13 +695,8 @@ mod tests {
     #[test]
     fn payload_variants_without_reasoning_effort_use_legacy_thinking() {
         let messages = sample_messages();
-        let variants = build_anthropic_payload_variants(
-            "claude-sonnet-4-6",
-            "system",
-            &messages,
-            false,
-            None,
-        );
+        let variants =
+            build_anthropic_payload_variants("claude-sonnet-4-6", "system", &messages, false, None);
 
         assert_eq!(variants.len(), 2);
 
@@ -873,13 +868,8 @@ mod tests {
     #[test]
     fn payload_variants_preserve_string_message_content_as_text_block() {
         let messages = sample_messages();
-        let variants = build_anthropic_payload_variants(
-            "claude-sonnet-4-6",
-            "system",
-            &messages,
-            false,
-            None,
-        );
+        let variants =
+            build_anthropic_payload_variants("claude-sonnet-4-6", "system", &messages, false, None);
 
         let first_message = &variants[0]["messages"][0];
         assert_eq!(first_message["role"], "user");

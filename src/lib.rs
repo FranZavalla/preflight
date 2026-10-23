@@ -5,10 +5,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 pub mod ast;
+pub mod logging;
 pub mod model;
 pub mod providers;
 
 use self::ast::{generate_ast_and_validator_context, sha256_hex};
+use self::logging::{LogLevel, format_duration_ms};
 use self::model::{
     AnalysisStateJson, AstMetadata, MiniPrompt, PermissionPromptSpec, ProviderSpec,
     SkillIterationResult, ValidatorContextMap, VulnerabilityFinding, VulnerabilityReportSpec,
@@ -18,6 +20,8 @@ use self::providers::shared::{UserStopped, glob_match, is_ignored_path};
 use self::providers::{AnalysisProvider, build_provider};
 
 const DEFAULT_SKILLS_DIR: &str = "skills/vulnerabilities";
+/// Default destination for the timestamped progress log.
+const DEFAULT_LOG_FILE: &str = ".tx3/audit/preflight.log";
 
 /// Bumped when audit behavior changes without a binary version bump.
 const AUDIT_CONTEXT_VERSION: &str = "1";
@@ -85,9 +89,24 @@ pub struct Args {
     #[arg(long)]
     pub api_key_env: Option<String>,
 
-    /// Print chat-style progress of model requests and local tool actions while auditing.
-    #[arg(long, default_value_t = false)]
-    pub ai_logs: bool,
+    /// Print chat-style progress while auditing.
+    ///
+    /// Pass the flag alone for one compact block per skill and one line per
+    /// step, or `--ai-logs=full` to see raw model output and reasoning.
+    #[arg(
+        long,
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "brief",
+        default_value_t = LogLevel::Off
+    )]
+    pub ai_logs: LogLevel,
+
+    /// Also write the progress log to this file, with timestamps.
+    ///
+    /// Only written when `--ai-logs` is set. Pass an empty value to disable it.
+    #[arg(long, default_value = DEFAULT_LOG_FILE)]
+    pub log_file: PathBuf,
 
     /// Maximum agent steps per skill before stopping.
     #[arg(long, default_value_t = crate::providers::shared::DEFAULT_MAX_AGENT_STEPS)]
@@ -122,12 +141,37 @@ pub struct Args {
     pub exclude_tests: bool,
 }
 
+/// Decides whether this run opens a log file.
+///
+/// The default path is written only when `--ai-logs` is on, so a silent run does
+/// not create an empty file. A path the user named explicitly, or an empty path
+/// used to opt out, is always honoured.
+fn resolve_log_file(log_file: &Path, ai_logs: LogLevel) -> Option<PathBuf> {
+    if log_file.as_os_str().is_empty() {
+        return None;
+    }
+
+    if ai_logs.is_enabled() || log_file != Path::new(DEFAULT_LOG_FILE) {
+        return Some(log_file.to_path_buf());
+    }
+
+    None
+}
+
 pub fn run(args: Args) -> Result<()> {
     let provider = build_provider(&args)?;
     run_analysis(args, provider.as_ref())
 }
 
 fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
+    // A file log keeps a durable record without scrolling the terminal, so it
+    // runs alongside brief terminal output rather than replacing it.
+    // The default path is only opened when logging is on, so a silent run
+    // leaves no empty log behind. An explicitly named file is always written.
+    let log_file = resolve_log_file(&args.log_file, args.ai_logs);
+    let tee_terminal = args.ai_logs.is_enabled();
+    logging::init(log_file.as_deref(), tee_terminal)?;
+
     let skills_dir = PathBuf::from(&args.skills_dir);
     let state_out = PathBuf::from(&args.state_out);
     let report_out = PathBuf::from(&args.report_out);
@@ -281,7 +325,7 @@ struct SkillLoopContext<'a> {
     permission_prompt: &'a PermissionPromptSpec,
     validator_context: &'a ValidatorContextMap,
     provider: &'a dyn AnalysisProvider,
-    ai_logs: bool,
+    ai_logs: LogLevel,
     state_out: &'a Path,
     resume_strict: bool,
 }
@@ -332,7 +376,7 @@ fn run_skill_loop(
         log_audit_progress(
             context.ai_logs,
             format!(
-                "Skill {}/{} • analyzing '{}' ({})",
+                "▶ {}/{} {} ({})",
                 skill_idx + 1,
                 total_skills,
                 skill.id,
@@ -464,7 +508,7 @@ fn record_iteration(
     log_audit_progress(
         context.ai_logs,
         format!(
-            "Skill '{}' finished • status={} • findings={} • tokens=({}) • state persisted",
+            "✔ {} {} findings={} tokens=({}) state saved",
             skill_id,
             status,
             findings_count,
@@ -644,9 +688,9 @@ fn format_total_token_usage(usage: &crate::model::TokenUsage) -> String {
     parts.join(", ")
 }
 
-fn log_audit_progress(enabled: bool, message: impl AsRef<str>) {
-    if enabled {
-        eprintln!("🧭 {}", message.as_ref());
+fn log_audit_progress(level: LogLevel, message: impl AsRef<str>) {
+    if level.is_enabled() {
+        logging::write_line("🧭 ", message.as_ref());
     }
 }
 
@@ -981,20 +1025,6 @@ fn format_provider(provider: &ProviderSpec) -> String {
     }
 }
 
-fn format_duration_ms(milliseconds: u64) -> String {
-    if milliseconds < 1_000 {
-        return format!("{}ms", milliseconds);
-    }
-
-    let seconds = milliseconds as f64 / 1_000.0;
-    if seconds < 60.0 {
-        format!("{:.1}s", seconds)
-    } else {
-        let total_seconds = milliseconds / 1_000;
-        format!("{}m {}s", total_seconds / 60, total_seconds % 60)
-    }
-}
-
 fn truncate_summary_text(summary: &str) -> String {
     const MAX_CHARS: usize = 240;
     let summary = summary.trim().replace('\n', " ");
@@ -1294,6 +1324,28 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn log_file_default_only_applies_when_logging_is_on() {
+        let default = Path::new(DEFAULT_LOG_FILE);
+        let custom = Path::new("/tmp/custom.log");
+
+        assert_eq!(resolve_log_file(default, LogLevel::Off), None);
+        assert_eq!(
+            resolve_log_file(default, LogLevel::Brief),
+            Some(default.to_path_buf())
+        );
+        assert_eq!(
+            resolve_log_file(custom, LogLevel::Off),
+            Some(custom.to_path_buf()),
+            "an explicitly named file is always written"
+        );
+        assert_eq!(
+            resolve_log_file(Path::new(""), LogLevel::Full),
+            None,
+            "an empty path opts out"
+        );
+    }
+
+    #[test]
     fn parse_skill_content_reads_frontmatter_and_guidance() {
         let content = r#"---
 id: strict-value-equality-001
@@ -1585,7 +1637,7 @@ body
                 validator_context: &ValidatorContextMap::default(),
                 project_root: temp.path(),
                 permission_prompt: &permission_spec(temp.path()),
-                ai_logs: false,
+                ai_logs: LogLevel::Off,
                 state_out: &state_out,
                 resume_strict: false,
             },
@@ -1653,7 +1705,7 @@ body
                 validator_context: &ValidatorContextMap::default(),
                 project_root: temp.path(),
                 permission_prompt: &permission_spec(temp.path()),
-                ai_logs: false,
+                ai_logs: LogLevel::Off,
                 state_out: &state_out,
                 resume_strict: false,
             },
@@ -1715,7 +1767,7 @@ body
                 validator_context: &ValidatorContextMap::default(),
                 project_root: temp.path(),
                 permission_prompt: &permission_spec(temp.path()),
-                ai_logs: false,
+                ai_logs: LogLevel::Off,
                 state_out: &state_out,
                 resume_strict: false,
             },
@@ -1947,7 +1999,7 @@ body
                 validator_context: &ValidatorContextMap::default(),
                 project_root: temp.path(),
                 permission_prompt: &permission_spec(temp.path()),
-                ai_logs: false,
+                ai_logs: LogLevel::Off,
                 state_out: &state_out,
                 resume_strict: false,
             },
@@ -2018,7 +2070,7 @@ body
                 validator_context: &ValidatorContextMap::default(),
                 project_root: temp.path(),
                 permission_prompt: &permission_spec(temp.path()),
-                ai_logs: false,
+                ai_logs: LogLevel::Off,
                 state_out: &state_out,
                 resume_strict: false,
             },
@@ -2085,7 +2137,7 @@ body
                 validator_context: &ValidatorContextMap::default(),
                 project_root: temp.path(),
                 permission_prompt: &permission_spec(temp.path()),
-                ai_logs: false,
+                ai_logs: LogLevel::Off,
                 state_out: &state_out,
                 resume_strict: true,
             },
@@ -2151,7 +2203,7 @@ body
                 validator_context: &ValidatorContextMap::default(),
                 project_root: temp.path(),
                 permission_prompt: &permission_spec(temp.path()),
-                ai_logs: false,
+                ai_logs: LogLevel::Off,
                 state_out: &state_out,
                 resume_strict: true,
             },
@@ -2216,7 +2268,7 @@ body
                 validator_context: &ValidatorContextMap::default(),
                 project_root: temp.path(),
                 permission_prompt: &permission_spec(temp.path()),
-                ai_logs: false,
+                ai_logs: LogLevel::Off,
                 state_out: &state_out,
                 resume_strict: false,
             },
@@ -2266,7 +2318,7 @@ body
                 validator_context: &ValidatorContextMap::default(),
                 project_root: temp.path(),
                 permission_prompt: &permission_spec(temp.path()),
-                ai_logs: false,
+                ai_logs: LogLevel::Off,
                 state_out: &state_out,
                 resume_strict: false,
             },
