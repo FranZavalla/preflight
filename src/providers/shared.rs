@@ -183,32 +183,10 @@ pub(super) fn stream_content_delta_to_stdout(
         state.ends_with_newline = false;
     }
 
-    let compact = compact_stream_delta(state, delta);
-    let _ = write!(stdout, "{}", compact);
+    let _ = write!(stdout, "{}", delta);
     let _ = stdout.flush();
-}
 
-/// Collapses repeated newlines and strips `\r` while preserving the state
-/// needed to handle a blank line split across two streamed deltas.
-fn compact_stream_delta(state: &mut ContentStreamState, delta: &str) -> String {
-    let mut compact = String::with_capacity(delta.len());
-    for character in delta.chars() {
-        if character == '\r' {
-            continue;
-        }
-
-        if character == '\n' {
-            if !state.ends_with_newline {
-                compact.push('\n');
-                state.ends_with_newline = true;
-            }
-        } else {
-            compact.push(character);
-            state.ends_with_newline = false;
-        }
-    }
-
-    compact
+    state.ends_with_newline = delta.ends_with('\n');
 }
 
 pub(super) fn finalize_content_stdout(enabled: bool, state: &mut ContentStreamState) {
@@ -276,14 +254,6 @@ pub(super) struct AgentLoopContext<'a> {
     pub(super) max_agent_steps: usize,
 }
 
-/// A model reply plus whether it was already streamed to the terminal. The
-/// agent loop uses this to avoid printing the same content twice.
-pub(super) struct ModelReply {
-    pub(super) content: String,
-    pub(super) usage: TokenUsage,
-    pub(super) streamed: bool,
-}
-
 /// The user declined to keep iterating; the whole audit must stop rather than
 /// moving on to the next skill.
 #[derive(Debug)]
@@ -306,7 +276,7 @@ pub(super) fn run_agent_loop<F>(
     mut request_model: F,
 ) -> Result<SkillIterationResult>
 where
-    F: FnMut(&[Value]) -> Result<ModelReply>,
+    F: FnMut(&[Value]) -> Result<(String, TokenUsage)>,
 {
     let AgentLoopContext {
         endpoint,
@@ -369,11 +339,21 @@ where
         log_agent_progress(
             ai_logs,
             format!(
-                "Step {}/{} • waiting for model response for skill '{}' ({})",
+                "Step {}/{} • requesting next action for skill '{}' ({})",
                 step_idx + 1,
                 max_steps,
                 skill.id,
                 endpoint
+            ),
+        );
+
+        log_agent_progress(
+            ai_logs,
+            format!(
+                "🤔 Thinking… waiting for model response (step {}/{}, skill='{}')",
+                step_idx + 1,
+                max_steps,
+                skill.id
             ),
         );
 
@@ -392,10 +372,7 @@ where
             );
         }
 
-        let reply = response_result?;
-        let streamed = reply.streamed;
-        let step_usage = reply.usage;
-        let content = reply.content;
+        let (content, step_usage) = response_result?;
         total_usage.add(&step_usage);
 
         if !step_usage.is_empty() {
@@ -416,8 +393,10 @@ where
 
         messages.push(json!({
             "role": "assistant",
-            "content": &content,
+            "content": content,
         }));
+
+        log_agent_progress(ai_logs, format!("Model output:\n{}", &content));
 
         let action = match parse_agent_action(&content) {
             Ok(action) => {
@@ -437,25 +416,11 @@ where
                     ));
                 }
 
-                if !streamed {
-                    log_agent_progress(
-                        ai_logs,
-                        format!(
-                            "Model output (non-stream): {}",
-                            compact_model_output(&content)
-                        ),
-                    );
-                }
-
                 log_agent_progress(
                     ai_logs,
                     format!(
-                        "Step {}/{} • unparseable reply ({}/{}), asking the model to retry: {}",
-                        step_idx + 1,
-                        max_steps,
-                        malformed_replies,
-                        MAX_MALFORMED_REPLIES,
-                        error
+                        "⚠️ Unparseable reply ({}/{}), asking the model to retry: {}",
+                        malformed_replies, MAX_MALFORMED_REPLIES, error
                     ),
                 );
 
@@ -468,16 +433,6 @@ where
                 continue;
             }
         };
-
-        log_agent_progress(
-            ai_logs,
-            format!(
-                "Step {}/{} • action: {}",
-                step_idx + 1,
-                max_steps,
-                summarize_agent_action(&action)
-            ),
-        );
 
         match action {
             AgentAction::Final(parsed) => {
@@ -1264,40 +1219,6 @@ where
     }
 }
 
-fn compact_model_output(content: &str) -> String {
-    const LIMIT: usize = 500;
-
-    let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.is_empty() {
-        return "(empty)".to_string();
-    }
-
-    if compact.chars().count() > LIMIT {
-        let mut truncated = compact.chars().take(LIMIT).collect::<String>();
-        truncated.push('…');
-        truncated
-    } else {
-        compact
-    }
-}
-
-fn summarize_agent_action(action: &AgentAction) -> String {
-    match action {
-        AgentAction::Final(parsed) => {
-            let status = parsed
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("completed");
-            let findings = parsed
-                .get("findings")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len);
-            format!("final status={} findings={}", status, findings)
-        }
-        AgentAction::ReadRequest(request) => summarize_read_request(request),
-    }
-}
-
 pub(super) fn summarize_read_request(request: &ReadRequest) -> String {
     match request {
         ReadRequest::ReadFile { path } => format!("read_file {}", path),
@@ -1990,28 +1911,6 @@ mod tests {
         assert!(!prompt.contains("ReadFile {"));
     }
 
-    #[test]
-    fn streamed_content_collapses_blank_lines_across_deltas() {
-        let mut state = ContentStreamState::default();
-
-        assert_eq!(compact_stream_delta(&mut state, "a\r\n\n"), "a\n");
-        assert_eq!(
-            compact_stream_delta(&mut state, "\n\nb"),
-            "b",
-            "a blank line split across deltas must still collapse"
-        );
-        assert_eq!(compact_stream_delta(&mut state, "\r\nc"), "\nc");
-    }
-
-    #[test]
-    fn compact_model_output_collapses_blank_lines() {
-        assert_eq!(
-            compact_model_output("{\n\n  \"action\": \"list_dir\",\n  \"path\": \".\"\n}"),
-            "{ \"action\": \"list_dir\", \"path\": \".\" }"
-        );
-        assert_eq!(compact_model_output(" \n\t "), "(empty)");
-    }
-
     fn dummy_skill() -> VulnerabilitySkill {
         VulnerabilitySkill {
             id: "test-skill".to_string(),
@@ -2110,11 +2009,7 @@ mod tests {
         let result = run_agent_loop(&skill, loop_context(&root, &prompt), &mut messages, |_| {
             let reply = replies[sent].clone();
             sent += 1;
-            Ok(ModelReply {
-                content: reply,
-                usage: TokenUsage::default(),
-                streamed: false,
-            })
+            Ok((reply, TokenUsage::default()))
         })
         .expect("loop should recover and finish");
 
@@ -2148,11 +2043,7 @@ mod tests {
 
         let error = run_agent_loop(&skill, loop_context(&root, &prompt), &mut messages, |_| {
             sent += 1;
-            Ok(ModelReply {
-                content: "still not json".to_string(),
-                usage: TokenUsage::default(),
-                streamed: false,
-            })
+            Ok(("still not json".to_string(), TokenUsage::default()))
         })
         .expect_err("persistent garbage should fail the skill");
 
