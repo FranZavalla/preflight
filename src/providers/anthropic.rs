@@ -28,6 +28,7 @@ pub struct AnthropicProvider {
     pub ai_logs: crate::logging::LogLevel,
     pub reasoning_effort: Option<String>,
     pub max_agent_steps: usize,
+    pub max_tool_output_bytes: usize,
 }
 
 fn build_anthropic_payload_variants(
@@ -579,6 +580,7 @@ impl AnalysisProvider for AnthropicProvider {
                 provider_label: "Anthropic provider",
                 skill_timeout: super::shared::DEFAULT_SKILL_TIMEOUT,
                 max_agent_steps: self.max_agent_steps,
+                max_tool_output_bytes: self.max_tool_output_bytes,
             },
             &mut messages,
             |messages| {

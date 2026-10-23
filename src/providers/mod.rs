@@ -78,6 +78,7 @@ pub fn build_provider(args: &Args) -> Result<Box<dyn AnalysisProvider>> {
                 reasoning_effort: args.reasoning_effort.clone(),
                 ollama_compat: false,
                 max_agent_steps: args.max_agent_steps,
+                max_tool_output_bytes: args.max_tool_output_bytes,
             }))
         }
         "anthropic" => {
@@ -109,6 +110,7 @@ pub fn build_provider(args: &Args) -> Result<Box<dyn AnalysisProvider>> {
                 ai_logs: args.ai_logs,
                 reasoning_effort,
                 max_agent_steps: args.max_agent_steps,
+                max_tool_output_bytes: args.max_tool_output_bytes,
             }))
         }
         "ollama" => Ok(Box::new(OpenAiProvider {
@@ -125,6 +127,7 @@ pub fn build_provider(args: &Args) -> Result<Box<dyn AnalysisProvider>> {
             reasoning_effort: args.reasoning_effort.clone(),
             ollama_compat: true,
             max_agent_steps: args.max_agent_steps,
+            max_tool_output_bytes: args.max_tool_output_bytes,
         })),
         value => Err(miette::miette!(
             "Unsupported provider '{}'. Expected one of: scaffold, heuristic, openai, anthropic, ollama",
