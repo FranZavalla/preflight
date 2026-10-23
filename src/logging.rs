@@ -129,20 +129,19 @@ pub fn write_line(prefixed: &str, message: &str) {
     }
 }
 
-/// `HH:MM:SS.mmm` in local-independent UTC, so log files from different
-/// machines can be compared without timezone math.
+/// RFC 3339 timestamp in UTC with an explicit `Z`, so a log that spans midnight
+/// stays unambiguous and files from different machines compare directly.
 fn timestamp() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let total_seconds = now.as_secs();
+    let seconds = i64::try_from(now.as_secs()).unwrap_or(i64::MAX);
     let millis = now.subsec_millis();
 
-    let seconds = total_seconds % 60;
-    let minutes = (total_seconds / 60) % 60;
-    let hours = (total_seconds / 3600) % 24;
+    let datetime = chrono::DateTime::from_timestamp(seconds, 0)
+        .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).expect("epoch is valid"));
 
-    format!("{:02}:{:02}:{:02}.{:03}", hours, minutes, seconds, millis)
+    format!("{}.{:03}Z", datetime.format("%Y-%m-%dT%H:%M:%S"), millis)
 }
 
 /// Shortens a byte count to a human-readable size.
@@ -156,16 +155,24 @@ pub fn format_bytes(bytes: usize) -> String {
     }
 }
 
-/// Shortens a duration to seconds or minutes.
-pub fn format_duration(duration: std::time::Duration) -> String {
-    let seconds = duration.as_secs_f64();
+/// The single duration format used by both the report and the logs.
+pub fn format_duration_ms(milliseconds: u64) -> String {
+    if milliseconds < 1_000 {
+        return format!("{}ms", milliseconds);
+    }
+
+    let seconds = milliseconds as f64 / 1_000.0;
     if seconds < 60.0 {
         format!("{:.1}s", seconds)
     } else {
-        let minutes = (seconds / 60.0).floor();
-        let rest = seconds - minutes * 60.0;
-        format!("{:.0}m {:02.0}s", minutes, rest)
+        let total_seconds = milliseconds / 1_000;
+        format!("{}m {}s", total_seconds / 60, total_seconds % 60)
     }
+}
+
+/// Convenience wrapper for callers that already hold a `Duration`.
+pub fn format_duration(duration: std::time::Duration) -> String {
+    format_duration_ms(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -190,14 +197,23 @@ mod tests {
     }
 
     #[test]
-    fn durations_switch_to_minutes() {
+    fn durations_share_one_format() {
+        assert_eq!(format_duration_ms(500), "500ms");
+        assert_eq!(format_duration_ms(1_500), "1.5s");
+        assert_eq!(format_duration_ms(65_000), "1m 5s");
         assert_eq!(format_duration(Duration::from_millis(1500)), "1.5s");
         assert_eq!(format_duration(Duration::from_secs(75)), "1m 15s");
     }
 
     #[test]
-    fn timestamps_are_fixed_width() {
+    fn timestamps_include_date_and_zone() {
         let stamp = timestamp();
-        assert_eq!(stamp.len(), 12, "unexpected timestamp {stamp}");
+
+        // 2026-10-23T16:03:41.123Z
+        assert_eq!(stamp.len(), 24, "unexpected timestamp {stamp}");
+        assert!(stamp.ends_with('Z'), "zone marker missing: {stamp}");
+        assert_eq!(&stamp[4..5], "-");
+        assert_eq!(&stamp[10..11], "T");
+        assert_eq!(&stamp[19..20], ".");
     }
 }

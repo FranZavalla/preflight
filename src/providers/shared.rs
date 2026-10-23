@@ -348,7 +348,7 @@ where
             ));
         }
 
-        log_detail(
+        log_full(
             ai_logs,
             format!(
                 "step {}/{}, requesting '{}' from {}",
@@ -447,7 +447,7 @@ where
                     .filter(|value| !value.trim().is_empty());
 
                 if let Some(summary) = analysis_summary {
-                    log_detail(ai_logs, format!("analysis summary:\n{}", summary));
+                    log_full(ai_logs, format!("analysis summary:\n{}", summary));
                 }
 
                 log_step(
@@ -478,7 +478,7 @@ where
                 return Ok(iteration_from_parsed(skill, parsed, total_usage));
             }
             AgentAction::ReadRequest(request) => {
-                log_detail(
+                log_full(
                     ai_logs,
                     format!("running {}", describe_read_request_friendly(&request)),
                 );
@@ -1302,14 +1302,8 @@ pub(super) fn log_step(level: crate::logging::LogLevel, message: impl AsRef<str>
     }
 }
 
-/// Details worth keeping in the file log, but too noisy for a brief terminal.
-pub(super) fn log_detail(level: crate::logging::LogLevel, message: impl AsRef<str>) {
-    if level.is_full() {
-        crate::logging::write_line("🤖 ", message.as_ref());
-    }
-}
-
-/// Raw model output and tool payloads. Only the `full` level prints these.
+/// Diagnostic detail: request lines, analysis summaries and raw model or tool
+/// payloads. Only the `full` level prints these.
 pub(super) fn log_full(level: crate::logging::LogLevel, message: impl AsRef<str>) {
     if level.is_full() {
         crate::logging::write_line("🤖 ", message.as_ref());

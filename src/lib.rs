@@ -10,7 +10,7 @@ pub mod model;
 pub mod providers;
 
 use self::ast::{generate_ast_and_validator_context, sha256_hex};
-use self::logging::LogLevel;
+use self::logging::{LogLevel, format_duration_ms};
 use self::model::{
     AnalysisStateJson, AstMetadata, MiniPrompt, PermissionPromptSpec, ProviderSpec,
     SkillIterationResult, ValidatorContextMap, VulnerabilityFinding, VulnerabilityReportSpec,
@@ -1022,20 +1022,6 @@ fn format_provider(provider: &ProviderSpec) -> String {
     match &provider.model {
         Some(model) => format!("{} ({})", provider.name, model),
         None => provider.name.clone(),
-    }
-}
-
-fn format_duration_ms(milliseconds: u64) -> String {
-    if milliseconds < 1_000 {
-        return format!("{}ms", milliseconds);
-    }
-
-    let seconds = milliseconds as f64 / 1_000.0;
-    if seconds < 60.0 {
-        format!("{:.1}s", seconds)
-    } else {
-        let total_seconds = milliseconds / 1_000;
-        format!("{}m {}s", total_seconds / 60, total_seconds % 60)
     }
 }
 
