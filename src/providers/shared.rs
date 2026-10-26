@@ -362,6 +362,7 @@ where
     let mut step_idx = 0usize;
     let mut total_usage = TokenUsage::default();
     let mut malformed_replies = 0usize;
+    let mut tool_cache = ToolResultCache::default();
 
     loop {
         if Instant::now() >= deadline {
@@ -539,8 +540,14 @@ where
                     format!("running {}", describe_read_request_friendly(&request)),
                 );
 
-                let output = execute_read_request(&request, project_root, permission_prompt)
-                    .unwrap_or_else(|error| format!("Request failed: {}", error));
+                let output = execute_read_request_cached(
+                    &mut tool_cache,
+                    &request,
+                    project_root,
+                    permission_prompt,
+                    step_idx + 1,
+                )
+                .unwrap_or_else(|error| format!("Request failed: {}", error));
 
                 log_full(
                     ai_logs,
@@ -1376,6 +1383,70 @@ pub(super) fn log_step(level: crate::logging::LogLevel, message: impl AsRef<str>
     }
 }
 
+/// Per-skill cache of tool results the model has already been shown.
+///
+/// The agent loop re-reads the same file many times: without this, every repeat
+/// resends the whole (possibly capped) payload and burns context for nothing.
+#[derive(Default)]
+pub(super) struct ToolResultCache {
+    entries: std::collections::HashMap<String, CachedToolResult>,
+}
+
+struct CachedToolResult {
+    digest: String,
+    step: usize,
+}
+
+impl ToolResultCache {
+    fn key(request: &ReadRequest) -> Option<String> {
+        match request {
+            ReadRequest::ReadFile { path } => Some(format!("read\0{path}")),
+            ReadRequest::Grep {
+                pattern,
+                path,
+                context_lines,
+            } => Some(format!("grep\0{path}\0{context_lines}\0{pattern}")),
+            // Listings and file discovery are cheap and change more readily than
+            // a source file; caching them would return stale views of the tree.
+            ReadRequest::ListDir { .. } | ReadRequest::FindFiles { .. } => None,
+        }
+    }
+}
+
+/// Runs a request, replacing an unchanged repeat with a short note.
+pub(super) fn execute_read_request_cached(
+    cache: &mut ToolResultCache,
+    request: &ReadRequest,
+    project_root: &Path,
+    permission_prompt: &PermissionPromptSpec,
+    step: usize,
+) -> Result<String> {
+    let output = execute_read_request(request, project_root, permission_prompt)?;
+
+    let Some(key) = ToolResultCache::key(request) else {
+        return Ok(output);
+    };
+
+    let digest = format!("sha256:{}", crate::ast::sha256_hex(output.as_bytes()));
+    let note = cache.entries.get(&key).and_then(|cached| {
+        (cached.digest == digest).then(|| {
+            format!(
+                "Unchanged since step {} ({digest}). Content identical to what you \
+already have; not resent to save context. Do not re-read unless the file may \
+have been modified externally.",
+                cached.step
+            )
+        })
+    });
+
+    if let Some(note) = note {
+        return Ok(note);
+    }
+
+    cache.entries.insert(key, CachedToolResult { digest, step });
+    Ok(output)
+}
+
 /// Marks the first line of every tool-result message. Pruning recognises
 /// results by this prefix instead of remembering positions, so inserting or
 /// removing a message can never make it elide the wrong one.
@@ -1656,6 +1727,209 @@ mod tests {
             first_line
         );
         assert!(output.contains("2\tbad"));
+    }
+
+    #[test]
+    fn repeated_read_of_an_unchanged_file_returns_a_note_instead_of_content() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        let file = root.join("validators/spend.ak");
+
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("create dir");
+        std::fs::write(&file, "validator spend {}\nbad\n").expect("write file");
+
+        let prompt = workspace_prompt(root, vec!["cat"]);
+        let canonical_root = root.canonicalize().expect("canonical root");
+        let request = ReadRequest::ReadFile {
+            path: "validators/spend.ak".to_string(),
+        };
+        let mut cache = ToolResultCache::default();
+
+        let first = execute_read_request_cached(&mut cache, &request, &canonical_root, &prompt, 3)
+            .expect("first read should be allowed");
+        assert!(
+            first.contains("1\tvalidator spend"),
+            "the first read must carry the content: {first}"
+        );
+
+        let second = execute_read_request_cached(&mut cache, &request, &canonical_root, &prompt, 5)
+            .expect("repeat read should be allowed");
+
+        assert!(
+            !second.contains("bad"),
+            "a repeat read must not resend the file: {second}"
+        );
+        assert!(
+            second.contains("Unchanged since step 3"),
+            "the note should name the step that produced it: {second}"
+        );
+        assert!(
+            second.contains("sha256:"),
+            "the note should carry a digest: {second}"
+        );
+    }
+
+    #[test]
+    fn the_cache_distinguishes_unchanged_from_changed_content() {
+        // Same length, different bytes: a length-based or path-based cache would
+        // wrongly report "unchanged" here, so this pins the digest comparison.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        let file = root.join("validators/spend.ak");
+
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("create dir");
+        std::fs::write(&file, "validator spend {}\n").expect("write file");
+
+        let prompt = workspace_prompt(root, vec!["cat"]);
+        let canonical_root = root.canonicalize().expect("canonical root");
+        let request = ReadRequest::ReadFile {
+            path: "validators/spend.ak".to_string(),
+        };
+        let mut cache = ToolResultCache::default();
+
+        let first = execute_read_request_cached(&mut cache, &request, &canonical_root, &prompt, 1)
+            .expect("first read");
+        assert!(first.contains("validator spend"));
+
+        std::fs::write(&file, "validator spend {}\n").expect("rewrite identical file");
+        let same = execute_read_request_cached(&mut cache, &request, &canonical_root, &prompt, 2)
+            .expect("second read");
+        assert!(
+            same.contains("Unchanged since step 1"),
+            "identical bytes must hit the cache: {same}"
+        );
+
+        // Same byte length as the original, different content.
+        std::fs::write(&file, "validator spend X\n").expect("rewrite changed file");
+        let changed =
+            execute_read_request_cached(&mut cache, &request, &canonical_root, &prompt, 3)
+                .expect("third read");
+        assert!(
+            changed.contains("validator spend X"),
+            "different bytes of the same length must be resent: {changed}"
+        );
+        assert!(!changed.contains("Unchanged since"));
+    }
+
+    #[test]
+    fn grep_cache_keys_on_pattern_path_and_context_lines() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        let file = root.join("validators/spend.ak");
+
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("create dir");
+        std::fs::write(&file, "validator spend {}\nspend again\n").expect("write file");
+
+        let prompt = workspace_prompt(root, vec!["grep"]);
+        let canonical_root = root.canonicalize().expect("canonical root");
+        let mut cache = ToolResultCache::default();
+
+        let grep_request = |pattern: &str, context_lines: usize| ReadRequest::Grep {
+            pattern: pattern.to_string(),
+            path: "validators/spend.ak".to_string(),
+            context_lines,
+        };
+
+        let first = execute_read_request_cached(
+            &mut cache,
+            &grep_request("spend", 2),
+            &canonical_root,
+            &prompt,
+            1,
+        )
+        .expect("read");
+        assert!(first.contains("spend"), "first grep returns matches");
+
+        let same = execute_read_request_cached(
+            &mut cache,
+            &grep_request("spend", 2),
+            &canonical_root,
+            &prompt,
+            2,
+        )
+        .expect("repeat");
+        assert!(
+            same.contains("Unchanged since step 1"),
+            "an identical grep must hit the cache: {same}"
+        );
+
+        let other_context = execute_read_request_cached(
+            &mut cache,
+            &grep_request("spend", 0),
+            &canonical_root,
+            &prompt,
+            3,
+        )
+        .expect("narrower grep");
+        assert!(
+            !other_context.contains("Unchanged since"),
+            "a different context_lines is a different request: {other_context}"
+        );
+
+        let other_pattern = execute_read_request_cached(
+            &mut cache,
+            &grep_request("validator", 2),
+            &canonical_root,
+            &prompt,
+            4,
+        )
+        .expect("different pattern");
+        assert!(
+            !other_pattern.contains("Unchanged since"),
+            "a different pattern is a different request: {other_pattern}"
+        );
+    }
+
+    #[test]
+    fn listings_and_find_results_are_never_cached() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        let file = root.join("validators/spend.ak");
+
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("create dir");
+        std::fs::write(&file, "validator spend {}\n").expect("write file");
+
+        let prompt = workspace_prompt(root, vec!["ls", "find"]);
+        let canonical_root = root.canonicalize().expect("canonical root");
+        let mut cache = ToolResultCache::default();
+
+        for step in 1..=2 {
+            let listing = execute_read_request_cached(
+                &mut cache,
+                &ReadRequest::ListDir {
+                    path: "validators".to_string(),
+                },
+                &canonical_root,
+                &prompt,
+                step,
+            )
+            .expect("list_dir should be allowed");
+            assert!(
+                !listing.contains("Unchanged since"),
+                "directory listings must always be fresh (step {step}): {listing}"
+            );
+
+            let found = execute_read_request_cached(
+                &mut cache,
+                &ReadRequest::FindFiles {
+                    path: ".".to_string(),
+                    glob: Some("*.ak".to_string()),
+                },
+                &canonical_root,
+                &prompt,
+                step,
+            )
+            .expect("find_files should be allowed");
+            assert!(
+                !found.contains("Unchanged since"),
+                "file discovery must always be fresh (step {step}): {found}"
+            );
+        }
+
+        assert!(
+            cache.entries.is_empty(),
+            "neither listings nor discovery should populate the cache"
+        );
     }
 
     #[test]
@@ -2420,6 +2694,65 @@ mod tests {
         .expect_err("zero budget should stop immediately");
 
         assert!(error.to_string().contains("skill budget"));
+    }
+
+    #[test]
+    fn the_loop_tells_the_model_when_a_file_is_unchanged() {
+        // The model asked for the same file twice; the second answer must be the
+        // cache note, not a second copy of the file.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        let file = root.join("validators/spend.ak");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("create dir");
+        std::fs::write(&file, "validator spend {}\n").expect("write file");
+
+        let canonical_root = root.canonicalize().expect("canonical root");
+        let prompt = workspace_prompt(&canonical_root, vec!["cat"]);
+        let read = json!({"action": "read_file", "path": "validators/spend.ak"}).to_string();
+        let replies = [
+            read.clone(),
+            read,
+            json!({"status": "completed", "findings": []}).to_string(),
+        ];
+        let mut sent = 0usize;
+        let skill = dummy_skill();
+        let mut messages = Vec::new();
+
+        run_agent_loop(
+            &skill,
+            loop_context(&canonical_root, &prompt),
+            &mut messages,
+            |_| {
+                let reply = replies[sent].clone();
+                sent += 1;
+                Ok((reply, TokenUsage::default()))
+            },
+        )
+        .expect("loop should finish");
+
+        let tool_results = messages
+            .iter()
+            .filter(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("Tool result for "))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(tool_results.len(), 2, "both reads produced a tool result");
+        assert!(
+            tool_results[0]["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("validator spend")),
+            "the first read carries the file"
+        );
+        assert!(
+            tool_results[1]["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("Unchanged since step 1")),
+            "the second read is a cache note: {}",
+            tool_results[1]["content"]
+        );
     }
 
     #[test]
