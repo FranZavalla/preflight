@@ -112,12 +112,6 @@ pub struct Args {
     #[arg(long, default_value_t = crate::providers::shared::DEFAULT_MAX_AGENT_STEPS)]
     pub max_agent_steps: usize,
 
-    /// Maximum bytes of local tool output sent to the model per request.
-    ///
-    /// Larger results are truncated with a note; pass 0 to disable the cap.
-    #[arg(long, default_value_t = crate::providers::shared::DEFAULT_MAX_TOOL_OUTPUT_BYTES)]
-    pub max_tool_output_bytes: usize,
-
     /// Optional reasoning effort hint for OpenAI-compatible providers (e.g. low|medium|high).
     #[arg(long)]
     pub reasoning_effort: Option<String>,

@@ -23,22 +23,6 @@ pub(crate) const DEFAULT_SKILL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub(crate) const DEFAULT_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// Maximum time to establish a model connection.
 pub(crate) const DEFAULT_REQUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Default cap on the bytes of local tool output handed to the model.
-///
-/// A single `read_file` on a large validator, or a loose `grep`, can otherwise
-/// put hundreds of kilobytes into the conversation and every later step resends
-/// them. Larger files are still readable through a narrower request.
-pub(crate) const DEFAULT_MAX_TOOL_OUTPUT_BYTES: usize = 32 * 1024;
-/// Tool results kept verbatim in the conversation.
-const MAX_RETAINED_TOOL_RESULTS: usize = 6;
-
-/// Tool results tolerated before a prune runs.
-///
-/// Pruning rewrites older messages, which invalidates provider prompt caching
-/// at or before the rewrite. Draining down to `MAX_RETAINED_TOOL_RESULTS` only
-/// after twice that many have accumulated pays that invalidation once per six
-/// steps instead of once per step.
-const TOOL_RESULT_PRUNE_TRIGGER: usize = MAX_RETAINED_TOOL_RESULTS * 2;
 /// Consecutive unparseable replies tolerated before a skill is abandoned.
 const MAX_MALFORMED_REPLIES: usize = 3;
 const MALFORMED_REPLY_NUDGE: &str = "Your last message was not valid JSON. \
@@ -266,48 +250,10 @@ pub(super) fn build_initial_user_prompt(
         )
 }
 
-pub(super) fn build_tool_result_user_prompt(
-    request: &ReadRequest,
-    output: &str,
-    max_output_bytes: usize,
-) -> String {
+pub(super) fn build_tool_result_user_prompt(request: &ReadRequest, output: &str) -> String {
     TOOL_RESULT_PROMPT_TEMPLATE
         .replace("{{REQUEST}}", &summarize_read_request(request))
-        .replace(
-            "{{OUTPUT}}",
-            &truncate_tool_output(output, max_output_bytes),
-        )
-}
-
-/// Caps one tool result so a single oversized read or grep cannot dominate the
-/// conversation. `0` disables the cap.
-pub(super) fn truncate_tool_output(output: &str, max_output_bytes: usize) -> String {
-    if max_output_bytes == 0 || output.len() <= max_output_bytes {
-        return output.to_string();
-    }
-
-    let mut cut = max_output_bytes;
-    while cut > 0 && !output.is_char_boundary(cut) {
-        cut -= 1;
-    }
-
-    // Prefer a line boundary so the model never reads half a line of Aiken as
-    // if it were complete. The byte cut is a fallback when no line break is
-    // reasonably close to the budget.
-    let cut = output[..cut]
-        .rfind('\n')
-        .filter(|newline| newline.saturating_mul(2) >= cut)
-        .map(|newline| newline + 1)
-        .unwrap_or(cut);
-
-    format!(
-        "{}\n… (truncated: {} of {} bytes shown. Re-request with a narrower \
-scope -- a tighter grep pattern, a more specific path -- if you need the rest. \
-Do not treat what you have as the complete output.)",
-        &output[..cut],
-        cut,
-        output.len()
-    )
+        .replace("{{OUTPUT}}", output)
 }
 
 pub(super) struct AgentLoopContext<'a> {
@@ -318,7 +264,6 @@ pub(super) struct AgentLoopContext<'a> {
     pub(super) provider_label: &'a str,
     pub(super) skill_timeout: Duration,
     pub(super) max_agent_steps: usize,
-    pub(super) max_tool_output_bytes: usize,
 }
 
 /// The user declined to keep iterating; the whole audit must stop rather than
@@ -353,7 +298,6 @@ where
         provider_label,
         skill_timeout,
         max_agent_steps,
-        max_tool_output_bytes,
     } = context;
 
     let deadline = Instant::now() + skill_timeout;
@@ -550,23 +494,14 @@ where
                     ),
                 );
 
-                let was_truncated =
-                    max_tool_output_bytes > 0 && output.len() > max_tool_output_bytes;
-                let sent_bytes = if was_truncated {
-                    max_tool_output_bytes
-                } else {
-                    output.len()
-                };
-
                 log_step(
                     ai_logs,
                     format!(
-                        "step {}/{}  {:<32} {:>8}{}  {}{}",
+                        "step {}/{}  {:<32} {:>8}  {}{}",
                         step_idx + 1,
                         max_steps,
                         truncate_action(&summarize_read_request(&request)),
-                        crate::logging::format_bytes(sent_bytes),
-                        if was_truncated { " (capped)" } else { "" },
+                        crate::logging::format_bytes(output.len()),
                         crate::logging::format_duration(step_started_at.elapsed()),
                         format_usage_suffix(&step_usage)
                     ),
@@ -574,14 +509,8 @@ where
 
                 messages.push(json!({
                     "role": "user",
-                    "content": build_tool_result_user_prompt(
-                        &request,
-                        &output,
-                        max_tool_output_bytes,
-                    ),
+                    "content": build_tool_result_user_prompt(&request, &output),
                 }));
-
-                prune_stale_tool_results(messages, ai_logs);
             }
         }
 
@@ -1376,79 +1305,7 @@ pub(super) fn log_step(level: crate::logging::LogLevel, message: impl AsRef<str>
     }
 }
 
-/// Marks the first line of every tool-result message. Pruning recognises
-/// results by this prefix instead of remembering positions, so inserting or
-/// removing a message can never make it elide the wrong one.
-const TOOL_RESULT_MARKER: &str = "Tool result for ";
-
-/// Replaces the oldest tool results with a stub once too many have accumulated.
-///
-/// Per-result truncation bounds one read; this bounds the whole skill. Without
-/// it a 30-step run carries all 30 results forever, and the ceiling is the step
-/// count times the cap regardless of how well behaved any single read was. The
-/// model has already reasoned over these -- its conclusions live in the
-/// assistant turns, which are kept -- so what is dropped is re-readable detail,
-/// and the stub names the request so it can ask again.
-///
-/// Results are found by their marker rather than by stored index: the message
-/// list is append-only today, but an index would silently point at the wrong
-/// message if that ever changed.
-fn prune_stale_tool_results(messages: &mut [Value], ai_logs: crate::logging::LogLevel) {
-    let tool_results = messages
-        .iter()
-        .enumerate()
-        .filter(|(_, message)| is_tool_result_message(message))
-        .map(|(index, _)| index)
-        .collect::<Vec<usize>>();
-
-    if tool_results.len() < TOOL_RESULT_PRUNE_TRIGGER {
-        return;
-    }
-
-    let elide_count = tool_results.len() - MAX_RETAINED_TOOL_RESULTS;
-
-    for index in tool_results.into_iter().take(elide_count) {
-        let Some(message) = messages.get_mut(index) else {
-            continue;
-        };
-
-        let summary = message["content"]
-            .as_str()
-            .and_then(strip_tool_result_marker)
-            .unwrap_or("an earlier request")
-            .to_string();
-
-        message["content"] = Value::String(format!(
-            "{TOOL_RESULT_MARKER}{summary} was elided to keep this conversation \
-inside the model's context window. Request it again if you still need it."
-        ));
-    }
-
-    log_full(
-        ai_logs,
-        format!(
-            "elided {elide_count} older tool result(s), keeping the most recent \
-{MAX_RETAINED_TOOL_RESULTS}"
-        ),
-    );
-}
-
-fn is_tool_result_message(message: &Value) -> bool {
-    message["content"]
-        .as_str()
-        .is_some_and(|content| content.starts_with(TOOL_RESULT_MARKER))
-}
-
-/// Returns `summary` from `Tool result for {summary}:`, so a pruned message can
-/// name what it used to hold.
-fn strip_tool_result_marker(content: &str) -> Option<&str> {
-    content
-        .strip_prefix(TOOL_RESULT_MARKER)?
-        .split_once(':')
-        .map(|(summary, _)| summary.split('\n').next().unwrap_or(summary).trim())
-}
-
-/// Diagnostic detail: request lines, analysis summaries, elided results and raw
+/// Diagnostic detail: request lines, analysis summaries and raw model or tool
 /// payloads. Only the `full` level prints these.
 pub(super) fn log_full(level: crate::logging::LogLevel, message: impl AsRef<str>) {
     if level.is_full() {
@@ -2134,7 +1991,6 @@ mod tests {
                 path: "lib/a.ak".to_string(),
             },
             "file contents",
-            DEFAULT_MAX_TOOL_OUTPUT_BYTES,
         );
 
         assert!(prompt.contains("read_file lib/a.ak"));
@@ -2167,198 +2023,7 @@ mod tests {
             provider_label: "Test provider",
             skill_timeout: DEFAULT_SKILL_TIMEOUT,
             max_agent_steps: DEFAULT_MAX_AGENT_STEPS,
-            max_tool_output_bytes: DEFAULT_MAX_TOOL_OUTPUT_BYTES,
         }
-    }
-
-    #[test]
-    fn tool_output_within_the_cap_is_untouched() {
-        let output = "validator a { spend(_: Int) { True } }";
-        assert_eq!(truncate_tool_output(output, 4096), output);
-        assert_eq!(
-            truncate_tool_output(output, 0),
-            output,
-            "0 disables the cap"
-        );
-    }
-
-    #[test]
-    fn oversized_tool_output_is_truncated_with_a_warning() {
-        let output = (0..200)
-            .map(|line| format!("line {line}: datum == expected"))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let truncated = truncate_tool_output(&output, 512);
-
-        assert!(truncated.len() < output.len());
-        assert!(truncated.contains("truncated:"));
-        assert!(truncated.contains(&output.len().to_string()));
-        assert!(
-            truncated.ends_with("complete output.)"),
-            "the model must be told the remainder is missing"
-        );
-        let body = truncated
-            .split("\n… (truncated:")
-            .next()
-            .expect("body before the warning");
-        assert!(
-            output.starts_with(body) && body.ends_with('\n'),
-            "truncation should stop on a line boundary"
-        );
-    }
-
-    #[test]
-    fn truncation_respects_utf8_boundaries() {
-        let output = "ñ".repeat(400);
-        let truncated = truncate_tool_output(&output, 101);
-        assert!(truncated.contains("truncated:"));
-    }
-
-    fn tool_result_message(request: &str, output: &str) -> Value {
-        json!({
-            "role": "user",
-            "content": build_tool_result_user_prompt(
-                &ReadRequest::ReadFile {
-                    path: request.to_string(),
-                },
-                output,
-                DEFAULT_MAX_TOOL_OUTPUT_BYTES,
-            ),
-        })
-    }
-
-    fn conversation_with_tool_results(count: usize) -> Vec<Value> {
-        let mut messages = vec![json!({"role": "system", "content": "keep me"})];
-
-        for index in 0..count {
-            messages.push(json!({"role": "assistant", "content": format!("step {index}")}));
-            messages.push(tool_result_message(
-                &format!("lib/{index}.ak"),
-                &format!("body {index}"),
-            ));
-        }
-
-        messages
-    }
-
-    fn elided_count(messages: &[Value]) -> usize {
-        messages
-            .iter()
-            .filter(|message| {
-                message["content"]
-                    .as_str()
-                    .is_some_and(|text| text.contains("was elided"))
-            })
-            .count()
-    }
-
-    #[test]
-    fn tool_result_template_starts_with_the_prune_marker() {
-        // Pruning recognises results by this prefix, so a template change that
-        // drops it must fail here rather than silently disabling elision.
-        let prompt = build_tool_result_user_prompt(
-            &ReadRequest::ReadFile {
-                path: "lib/a.ak".to_string(),
-            },
-            "body",
-            DEFAULT_MAX_TOOL_OUTPUT_BYTES,
-        );
-
-        assert!(
-            prompt.starts_with(TOOL_RESULT_MARKER),
-            "tool-result template no longer starts with {TOOL_RESULT_MARKER:?}"
-        );
-    }
-
-    #[test]
-    fn pruning_elides_only_older_results() {
-        let mut messages = conversation_with_tool_results(TOOL_RESULT_PRUNE_TRIGGER);
-
-        prune_stale_tool_results(&mut messages, crate::logging::LogLevel::Off);
-
-        assert_eq!(
-            elided_count(&messages),
-            TOOL_RESULT_PRUNE_TRIGGER - MAX_RETAINED_TOOL_RESULTS
-        );
-        assert_eq!(messages[0]["content"], "keep me", "the prompt survives");
-
-        let elided = messages[2]["content"].as_str().expect("content");
-        assert!(elided.contains("was elided"));
-        assert!(
-            elided.contains("lib/0.ak"),
-            "the stub should name the request it replaced: {elided}"
-        );
-
-        let newest = messages
-            .iter()
-            .rev()
-            .find(|message| is_tool_result_message(message))
-            .expect("a tool result");
-        assert!(
-            newest["content"].as_str().is_some_and(
-                |text| text.contains(&format!("body {}", TOOL_RESULT_PRUNE_TRIGGER - 1))
-            ),
-            "the newest result stays verbatim"
-        );
-    }
-
-    #[test]
-    fn pruning_waits_for_the_trigger() {
-        let mut messages = conversation_with_tool_results(TOOL_RESULT_PRUNE_TRIGGER - 1);
-
-        prune_stale_tool_results(&mut messages, crate::logging::LogLevel::Off);
-
-        assert_eq!(elided_count(&messages), 0);
-    }
-
-    #[test]
-    fn pruning_survives_an_inserted_message() {
-        // An index-based implementation would elide the wrong entries here.
-        let mut messages = conversation_with_tool_results(TOOL_RESULT_PRUNE_TRIGGER);
-        messages.insert(0, json!({"role": "system", "content": "inserted later"}));
-
-        prune_stale_tool_results(&mut messages, crate::logging::LogLevel::Off);
-
-        assert_eq!(messages[0]["content"], "inserted later");
-        assert_eq!(messages[1]["content"], "keep me");
-        assert_eq!(
-            elided_count(&messages),
-            TOOL_RESULT_PRUNE_TRIGGER - MAX_RETAINED_TOOL_RESULTS
-        );
-    }
-
-    #[test]
-    fn pruning_survives_a_removed_message() {
-        let mut messages = conversation_with_tool_results(TOOL_RESULT_PRUNE_TRIGGER);
-        messages.remove(0);
-
-        prune_stale_tool_results(&mut messages, crate::logging::LogLevel::Off);
-
-        assert_eq!(
-            elided_count(&messages),
-            TOOL_RESULT_PRUNE_TRIGGER - MAX_RETAINED_TOOL_RESULTS
-        );
-        assert!(
-            messages
-                .iter()
-                .filter(|message| is_tool_result_message(message))
-                .all(|message| !message["content"]
-                    .as_str()
-                    .is_some_and(|text| text.contains("was elided was elided"))),
-            "a pruned stub must not be pruned again"
-        );
-    }
-
-    #[test]
-    fn pruning_is_idempotent() {
-        let mut messages = conversation_with_tool_results(TOOL_RESULT_PRUNE_TRIGGER);
-        prune_stale_tool_results(&mut messages, crate::logging::LogLevel::Off);
-        let after_first = elided_count(&messages);
-
-        prune_stale_tool_results(&mut messages, crate::logging::LogLevel::Off);
-
-        assert_eq!(elided_count(&messages), after_first);
     }
 
     #[test]
