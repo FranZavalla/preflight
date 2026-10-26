@@ -827,7 +827,10 @@ pub(super) fn execute_read_request(
             let scoped_path = resolve_scoped_path(project_root, path)?;
             enforce_read_scope(request, &scoped_path, project_root, permission_prompt)?;
             confirm_request_if_interactive(request, &scoped_path, project_root, permission_prompt)?;
-            let args = vec![scoped_path.to_string_lossy().to_string()];
+            // Line numbers are part of the evidence contract: findings carry a
+            // `line`, and the initial prompt tells the model to reuse the ones it
+            // was shown. Without `-n` it has to count lines by hand and guesses.
+            let args = vec!["-n".to_string(), scoped_path.to_string_lossy().to_string()];
             run_command_capture("cat", &args, project_root)
         }
         ReadRequest::Grep {
@@ -1617,6 +1620,43 @@ mod tests {
         MiniPrompt, PermissionPromptSpec, ValidatorContextEntry, ValidatorContextMap,
         ValidatorHandlerContext, ValidatorParameterContext,
     };
+
+    #[test]
+    fn execute_read_request_numbers_lines() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        let file = root.join("validators/spend.ak");
+
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("create dir");
+        std::fs::write(&file, "validator spend {}\nbad\n").expect("write file");
+
+        let prompt = PermissionPromptSpec {
+            shell: "bash".to_string(),
+            allowed_commands: vec!["cat".to_string()],
+            scope_rules: vec![],
+            workspace_root: root.display().to_string(),
+            read_scope: "workspace".to_string(),
+            interactive_permissions: false,
+            allowed_paths: vec![],
+        };
+
+        let output = execute_read_request(
+            &ReadRequest::ReadFile {
+                path: "validators/spend.ak".to_string(),
+            },
+            &root.canonicalize().expect("canonical root"),
+            &prompt,
+        )
+        .expect("request should be allowed");
+
+        let first_line = output.lines().next().expect("one line");
+        assert!(
+            first_line.trim_start().starts_with("1\tvalidator spend"),
+            "read output must carry line numbers, got: {}",
+            first_line
+        );
+        assert!(output.contains("2\tbad"));
+    }
 
     #[test]
     fn execute_read_request_strict_allows_known_file() {
