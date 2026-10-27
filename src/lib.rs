@@ -13,8 +13,8 @@ use self::ast::{generate_ast_and_validator_context, sha256_hex};
 use self::logging::{LogLevel, format_duration_ms};
 use self::model::{
     AnalysisStateJson, AstMetadata, MiniPrompt, PermissionPromptSpec, ProviderSpec,
-    SkillIterationResult, ValidatorContextMap, VulnerabilityFinding, VulnerabilityReportSpec,
-    VulnerabilitySkill,
+    ReasoningDefault, SkillIterationResult, SourceRevision, ValidatorContextMap,
+    VulnerabilityFinding, VulnerabilityReportSpec, VulnerabilitySkill,
 };
 use self::providers::shared::{UserStopped, glob_match, is_ignored_path};
 use self::providers::{AnalysisProvider, build_provider};
@@ -239,6 +239,7 @@ fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
         ast: Some(ast_context.metadata.clone()),
         validator_context: ast_context.validator_context.clone(),
         iterations: vec![],
+        source_revision: detect_source_revision(&project_root),
         total_token_usage: Default::default(),
         total_duration_ms: 0,
     };
@@ -254,6 +255,9 @@ fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
                     );
                 }
 
+                // The report must describe the code that was audited, so keep
+                // the revision recorded at the start rather than re-reading HEAD.
+                state.source_revision = previous.source_revision;
                 state.iterations = previous.iterations;
                 state.total_token_usage = previous.total_token_usage;
                 state.total_duration_ms = previous.total_duration_ms;
@@ -872,6 +876,69 @@ fn build_permission_prompt_spec(
     }
 }
 
+/// Reads the audited project's commit, if it is a git checkout.
+///
+/// Never fails the audit: a missing `git`, a missing repository or a detached
+/// worktree all degrade to `None` and the report says so.
+fn detect_source_revision(project_root: &Path) -> Option<SourceRevision> {
+    let commit = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+
+    // Untracked files count: a finding could sit in a file that is not committed.
+    let dirty = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .is_some_and(|output| output.status.success() && !output.stdout.is_empty());
+
+    Some(SourceRevision { commit, dirty })
+}
+
+fn render_source_revision_markdown(revision: Option<&SourceRevision>) -> String {
+    match revision {
+        Some(revision) => {
+            let short = &revision.commit[..revision.commit.len().min(7)];
+            if revision.dirty {
+                format!("Audited commit: `{}` + uncommitted changes", short)
+            } else {
+                format!("Audited commit: `{}`", short)
+            }
+        }
+        None => "Audited commit: not a git repository".to_string(),
+    }
+}
+
+fn render_provider_markdown(provider: &ProviderSpec) -> String {
+    format!("Provider / model: {}", format_provider(provider))
+}
+
+fn render_reasoning_markdown(provider: &ProviderSpec) -> String {
+    if let Some(effort) = &provider.reasoning_effort {
+        return format!("Reasoning effort: {}", effort);
+    }
+
+    match provider.reasoning_default {
+        // Unset for providers that never call a model.
+        None => "Reasoning effort: not applicable".to_string(),
+        Some(ReasoningDefault::ProviderDefault) => {
+            "Reasoning effort: not set (provider default)".to_string()
+        }
+        Some(ReasoningDefault::LegacyThinking) => {
+            "Reasoning effort: not set (legacy thinking, 1024-token budget)".to_string()
+        }
+    }
+}
+
 fn build_report(
     state: &AnalysisStateJson,
     skills: &[VulnerabilitySkill],
@@ -886,6 +953,9 @@ fn build_report(
     VulnerabilityReportSpec {
         title: "Vulnerability Report".to_string(),
         generated_at: chrono::Utc::now().to_rfc3339(),
+        source_revision_markdown: render_source_revision_markdown(state.source_revision.as_ref()),
+        provider_markdown: render_provider_markdown(&state.provider),
+        reasoning_markdown: render_reasoning_markdown(&state.provider),
         coverage_markdown: render_coverage_markdown(state, skills, findings.len(), aborted),
         findings,
     }
@@ -1284,6 +1354,9 @@ fn render_report_markdown(report: &VulnerabilityReportSpec) -> String {
 
     template
         .replace("{{ generated_at }}", &report.generated_at)
+        .replace("{{ source_revision }}", &report.source_revision_markdown)
+        .replace("{{ provider }}", &report.provider_markdown)
+        .replace("{{ reasoning }}", &report.reasoning_markdown)
         .replace("{{ coverage_markdown }}", &report.coverage_markdown)
         .replace("{{ findings_markdown }}", &findings_markdown)
 }
@@ -1548,6 +1621,124 @@ body
         }
     }
 
+    #[test]
+    fn source_revision_renders_clean_dirty_and_missing() {
+        let clean = SourceRevision {
+            commit: "9ec2af2a1b2c3d4e5f".to_string(),
+            dirty: false,
+        };
+        let dirty = SourceRevision {
+            commit: "9ec2af2a1b2c3d4e5f".to_string(),
+            dirty: true,
+        };
+
+        assert_eq!(
+            render_source_revision_markdown(Some(&clean)),
+            "Audited commit: `9ec2af2`"
+        );
+        assert_eq!(
+            render_source_revision_markdown(Some(&dirty)),
+            "Audited commit: `9ec2af2` + uncommitted changes"
+        );
+        assert_eq!(
+            render_source_revision_markdown(None),
+            "Audited commit: not a git repository"
+        );
+    }
+
+    #[test]
+    fn reasoning_line_distinguishes_set_unset_and_not_applicable() {
+        let mut provider = crate::model::ProviderSpec {
+            name: "openai-compatible".to_string(),
+            model: Some("glm".to_string()),
+            notes: String::new(),
+            reasoning_effort: Some("high".to_string()),
+            reasoning_default: None,
+        };
+
+        assert_eq!(
+            render_reasoning_markdown(&provider),
+            "Reasoning effort: high"
+        );
+
+        provider.reasoning_effort = None;
+        provider.reasoning_default = Some(ReasoningDefault::ProviderDefault);
+        assert_eq!(
+            render_reasoning_markdown(&provider),
+            "Reasoning effort: not set (provider default)"
+        );
+
+        provider.reasoning_default = Some(ReasoningDefault::LegacyThinking);
+        assert_eq!(
+            render_reasoning_markdown(&provider),
+            "Reasoning effort: not set (legacy thinking, 1024-token budget)"
+        );
+
+        provider.reasoning_default = None;
+        assert_eq!(
+            render_reasoning_markdown(&provider),
+            "Reasoning effort: not applicable"
+        );
+    }
+
+    #[test]
+    fn provider_spec_records_effort_or_its_default() {
+        // The providers are private to `providers`, so this mirrors the wiring
+        // instead of constructing one: effort set -> recorded, unset -> default.
+        let with_effort = crate::model::ProviderSpec {
+            name: "openai-compatible".to_string(),
+            model: Some("test-model".to_string()),
+            notes: String::new(),
+            reasoning_effort: Some("high".to_string()),
+            reasoning_default: None,
+        };
+        assert_eq!(
+            render_reasoning_markdown(&with_effort),
+            "Reasoning effort: high"
+        );
+
+        let without_effort = crate::model::ProviderSpec {
+            reasoning_effort: None,
+            reasoning_default: Some(ReasoningDefault::ProviderDefault),
+            ..with_effort.clone()
+        };
+        assert_eq!(
+            render_reasoning_markdown(&without_effort),
+            "Reasoning effort: not set (provider default)"
+        );
+        assert_eq!(
+            render_provider_markdown(&without_effort),
+            "Provider / model: openai-compatible (test-model)"
+        );
+    }
+
+    #[test]
+    fn report_header_carries_provenance() {
+        let report = VulnerabilityReportSpec {
+            title: "Vulnerability Report".to_string(),
+            generated_at: "2026-10-27T00:00:00Z".to_string(),
+            source_revision_markdown: "Audited commit: `abc1234`".to_string(),
+            provider_markdown: "Provider / model: openai-compatible (glm)".to_string(),
+            reasoning_markdown: "Reasoning effort: high".to_string(),
+            coverage_markdown: "coverage".to_string(),
+            findings: Vec::new(),
+        };
+
+        let markdown = render_report_markdown(&report);
+
+        assert!(markdown.contains("- Generated at: 2026-10-27T00:00:00Z"));
+        assert!(markdown.contains("- Audited commit: `abc1234`"));
+        assert!(markdown.contains("- Provider / model: openai-compatible (glm)"));
+        assert!(markdown.contains("- Reasoning effort: high"));
+    }
+
+    #[test]
+    fn detect_source_revision_is_none_outside_a_repository() {
+        let temp = tempfile::tempdir().expect("temp dir");
+
+        assert_eq!(detect_source_revision(temp.path()), None);
+    }
+
     fn empty_state() -> AnalysisStateJson {
         AnalysisStateJson {
             version: "2".to_string(),
@@ -1557,6 +1748,8 @@ body
                 name: "test".to_string(),
                 model: None,
                 notes: String::new(),
+                reasoning_effort: None,
+                reasoning_default: None,
             },
             permission_prompt: PermissionPromptSpec {
                 shell: "bash".to_string(),
@@ -1570,6 +1763,7 @@ body
             ast: None,
             validator_context: ValidatorContextMap::default(),
             iterations: Vec::new(),
+            source_revision: None,
             total_token_usage: crate::model::TokenUsage::default(),
             total_duration_ms: 0,
         }
@@ -1588,6 +1782,8 @@ body
                     name: "test".to_string(),
                     model: None,
                     notes: String::new(),
+                    reasoning_effort: None,
+                    reasoning_default: None,
                 }
             }
 
@@ -1672,6 +1868,8 @@ body
                     name: "test".to_string(),
                     model: None,
                     notes: String::new(),
+                    reasoning_effort: None,
+                    reasoning_default: None,
                 }
             }
 
@@ -1732,6 +1930,8 @@ body
                     name: "test".to_string(),
                     model: None,
                     notes: String::new(),
+                    reasoning_effort: None,
+                    reasoning_default: None,
                 }
             }
 
@@ -1816,6 +2016,8 @@ body
                 name: name.to_string(),
                 model: None,
                 notes: String::new(),
+                reasoning_effort: None,
+                reasoning_default: None,
             }),
             duration_ms,
             analysis_summary: None,
@@ -1956,6 +2158,8 @@ body
                     name: "test".to_string(),
                     model: None,
                     notes: String::new(),
+                    reasoning_effort: None,
+                    reasoning_default: None,
                 }
             }
 
@@ -2027,6 +2231,8 @@ body
                     name: "test".to_string(),
                     model: None,
                     notes: String::new(),
+                    reasoning_effort: None,
+                    reasoning_default: None,
                 }
             }
 
@@ -2094,6 +2300,8 @@ body
                     name: "test".to_string(),
                     model: None,
                     notes: String::new(),
+                    reasoning_effort: None,
+                    reasoning_default: None,
                 }
             }
 
@@ -2159,6 +2367,8 @@ body
                     name: "test".to_string(),
                     model: None,
                     notes: "current endpoint".to_string(),
+                    reasoning_effort: None,
+                    reasoning_default: None,
                 }
             }
 
@@ -2187,6 +2397,8 @@ body
             name: "test".to_string(),
             model: None,
             notes: "old endpoint".to_string(),
+            reasoning_effort: None,
+            reasoning_default: None,
         });
         state.iterations = vec![previous];
 
@@ -2225,6 +2437,8 @@ body
                     name: "test".to_string(),
                     model: None,
                     notes: String::new(),
+                    reasoning_effort: None,
+                    reasoning_default: None,
                 }
             }
 
@@ -2288,6 +2502,8 @@ body
                     name: "test".to_string(),
                     model: None,
                     notes: String::new(),
+                    reasoning_effort: None,
+                    reasoning_default: None,
                 }
             }
 
@@ -2359,6 +2575,8 @@ body
             name: "openai".to_string(),
             model: Some("gpt-5".to_string()),
             notes: String::new(),
+            reasoning_effort: None,
+            reasoning_default: None,
         });
         completed.analysis_summary = Some("checked the spend path".to_string());
 

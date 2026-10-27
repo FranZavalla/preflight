@@ -530,10 +530,21 @@ async fn non_stream_attempt(
 
 impl AnalysisProvider for AnthropicProvider {
     fn provider_spec(&self) -> ProviderSpec {
+        let reasoning_effort = self
+            .reasoning_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+
         ProviderSpec {
             name: "anthropic".to_string(),
             model: Some(self.model.clone()),
             notes: format!("Endpoint: {}", self.endpoint),
+            reasoning_default: reasoning_effort
+                .is_none()
+                .then_some(crate::model::ReasoningDefault::LegacyThinking),
+            reasoning_effort,
         }
     }
 

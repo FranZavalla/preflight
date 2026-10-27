@@ -16,6 +16,8 @@ impl AnalysisProvider for ScaffoldProvider {
             name: "scaffold".to_string(),
             model: None,
             notes: "Scaffolding-only provider. No external AI calls are performed.".to_string(),
+            reasoning_effort: None,
+            reasoning_default: None,
         }
     }
 

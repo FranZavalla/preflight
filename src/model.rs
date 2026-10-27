@@ -107,6 +107,14 @@ pub struct VulnerabilityFinding {
     pub line: Option<usize>,
 }
 
+/// Where the audited sources came from, when the project is a git checkout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRevision {
+    pub commit: String,
+    /// True when the working tree had changes the commit does not contain.
+    pub dirty: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisStateJson {
     pub version: String,
@@ -121,6 +129,10 @@ pub struct AnalysisStateJson {
     #[serde(default)]
     pub validator_context: ValidatorContextMap,
     pub iterations: Vec<SkillIterationResult>,
+    /// The commit of the audited project when the run started, kept so a
+    /// regenerated report still describes the code that was audited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<SourceRevision>,
     #[serde(default, skip_serializing_if = "TokenUsage::is_empty")]
     pub total_token_usage: TokenUsage,
     /// Sum of the per-skill durations recorded in this state.
@@ -199,6 +211,24 @@ pub struct ProviderSpec {
     pub name: String,
     pub model: Option<String>,
     pub notes: String,
+    /// The effort level the user asked for, when they set one. Not the level
+    /// the provider ends up using, which is not observable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// What preflight sends when no effort was requested, so a report never
+    /// claims an effort the run did not ask for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_default: Option<ReasoningDefault>,
+}
+
+/// The reasoning behavior used when `--reasoning-effort` is omitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReasoningDefault {
+    /// Nothing is sent; the model or gateway decides.
+    ProviderDefault,
+    /// Anthropic legacy thinking with a fixed token budget.
+    LegacyThinking,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,6 +258,12 @@ fn default_read_scope() -> String {
 pub struct VulnerabilityReportSpec {
     pub title: String,
     pub generated_at: String,
+    /// Rendered "Audited commit" line.
+    pub source_revision_markdown: String,
+    /// Rendered "Provider / model" line.
+    pub provider_markdown: String,
+    /// Rendered "Reasoning effort" line.
+    pub reasoning_markdown: String,
     pub coverage_markdown: String,
     pub findings: Vec<VulnerabilityFinding>,
 }

@@ -1,6 +1,9 @@
 # Aiken Vulnerability Report
 
 - Generated at: {{ generated_at }}
+- {{ source_revision }}
+- {{ provider }}
+- {{ reasoning }}
 
 ## Summary
 

@@ -20,6 +20,8 @@ impl AnalysisProvider for HeuristicProvider {
             model: None,
             notes: "Deterministic local heuristic provider. No external AI calls are performed."
                 .to_string(),
+            reasoning_effort: None,
+            reasoning_default: None,
         }
     }
 
