@@ -1292,10 +1292,15 @@ impl AnalysisProvider for OpenAiProvider {
             ApiFamily::Responses => "responses",
         };
 
-        let reasoning_note = self
+        let reasoning_effort = self
             .reasoning_effort
             .as_deref()
-            .filter(|value| !value.trim().is_empty())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+
+        let reasoning_note = reasoning_effort
+            .as_deref()
             .map(|value| format!(", reasoning_effort={}", value))
             .unwrap_or_default();
 
@@ -1306,6 +1311,14 @@ impl AnalysisProvider for OpenAiProvider {
                 "Endpoint: {} (api={}){}",
                 self.endpoint, api_note, reasoning_note
             ),
+            // Ollama compatibility asks for thinking explicitly, so it is not a
+            // provider default even when no effort was requested.
+            reasoning_default: reasoning_effort.is_none().then_some(if self.ollama_compat {
+                crate::model::ReasoningDefault::OllamaThink
+            } else {
+                crate::model::ReasoningDefault::ProviderDefault
+            }),
+            reasoning_effort,
         }
     }
 
