@@ -564,6 +564,7 @@ fn provider_matches(previous: Option<&ProviderSpec>, current: &ProviderSpec) -> 
     previous.is_some_and(|previous| {
         previous.name == current.name
             && previous.model == current.model
+            && previous.reasoning_effort == current.reasoning_effort
             && previous.notes == current.notes
     })
 }
@@ -907,7 +908,7 @@ fn detect_source_revision(project_root: &Path) -> Option<SourceRevision> {
 fn render_source_revision_markdown(revision: Option<&SourceRevision>) -> String {
     match revision {
         Some(revision) => {
-            let short = &revision.commit[..revision.commit.len().min(7)];
+            let short = revision.commit.chars().take(7).collect::<String>();
             if revision.dirty {
                 format!("Audited commit: `{}` + uncommitted changes", short)
             } else {
@@ -935,6 +936,9 @@ fn render_reasoning_markdown(provider: &ProviderSpec) -> String {
         }
         Some(ReasoningDefault::LegacyThinking) => {
             "Reasoning effort: not set (legacy thinking, 1024-token budget)".to_string()
+        }
+        Some(ReasoningDefault::OllamaThink) => {
+            "Reasoning effort: not set (think: true requested)".to_string()
         }
     }
 }
@@ -1713,6 +1717,57 @@ body
     }
 
     #[test]
+    fn ollama_reasoning_default_is_reported_as_requested_thinking() {
+        let provider = crate::model::ProviderSpec {
+            name: "openai-compatible".to_string(),
+            model: Some("llama".to_string()),
+            notes: String::new(),
+            reasoning_effort: None,
+            reasoning_default: Some(ReasoningDefault::OllamaThink),
+        };
+
+        assert_eq!(
+            render_reasoning_markdown(&provider),
+            "Reasoning effort: not set (think: true requested)"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_change_prevents_strict_reuse() {
+        let base = crate::model::ProviderSpec {
+            name: "anthropic".to_string(),
+            model: Some("claude".to_string()),
+            notes: "Endpoint: https://api.anthropic.com/v1/messages".to_string(),
+            reasoning_effort: None,
+            reasoning_default: Some(ReasoningDefault::LegacyThinking),
+        };
+
+        // Anthropic notes carry no effort, so this only passes because the
+        // comparison looks at the recorded field.
+        let with_effort = crate::model::ProviderSpec {
+            reasoning_effort: Some("high".to_string()),
+            ..base.clone()
+        };
+
+        assert!(!provider_matches(Some(&base), &with_effort));
+        assert!(provider_matches(Some(&base), &base));
+    }
+
+    #[test]
+    fn source_revision_truncation_is_char_safe() {
+        let revision = SourceRevision {
+            commit: "áéíóúabcdef".to_string(),
+            dirty: false,
+        };
+
+        // Byte slicing at 7 would panic here; taking 7 chars must not.
+        assert_eq!(
+            render_source_revision_markdown(Some(&revision)),
+            "Audited commit: `áéíóúab`"
+        );
+    }
+
+    #[test]
     fn report_header_carries_provenance() {
         let report = VulnerabilityReportSpec {
             title: "Vulnerability Report".to_string(),
@@ -1733,7 +1788,9 @@ body
     }
 
     #[test]
-    fn detect_source_revision_is_none_outside_a_repository() {
+    fn detect_source_revision_is_none_when_unavailable() {
+        // Covers both "not a git repository" and "git is not installed": the
+        // audit treats them the same, so this test does not distinguish them.
         let temp = tempfile::tempdir().expect("temp dir");
 
         assert_eq!(detect_source_revision(temp.path()), None);

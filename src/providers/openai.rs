@@ -1311,9 +1311,13 @@ impl AnalysisProvider for OpenAiProvider {
                 "Endpoint: {} (api={}){}",
                 self.endpoint, api_note, reasoning_note
             ),
-            reasoning_default: reasoning_effort
-                .is_none()
-                .then_some(crate::model::ReasoningDefault::ProviderDefault),
+            // Ollama compatibility asks for thinking explicitly, so it is not a
+            // provider default even when no effort was requested.
+            reasoning_default: reasoning_effort.is_none().then_some(if self.ollama_compat {
+                crate::model::ReasoningDefault::OllamaThink
+            } else {
+                crate::model::ReasoningDefault::ProviderDefault
+            }),
             reasoning_effort,
         }
     }

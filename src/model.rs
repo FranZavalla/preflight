@@ -229,6 +229,8 @@ pub enum ReasoningDefault {
     ProviderDefault,
     /// Anthropic legacy thinking with a fixed token budget.
     LegacyThinking,
+    /// Ollama compatibility mode asks for thinking with `think: true`.
+    OllamaThink,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
