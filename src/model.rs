@@ -119,6 +119,11 @@ pub struct SourceRevision {
 pub struct AnalysisStateJson {
     pub version: String,
     pub source_files: Vec<String>,
+    /// Aiken project roots covered by this run, relative to the workspace root.
+    /// A single entry for a normal project audit; several when the workspace is
+    /// a container of projects (or `--target` named more than one).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<String>,
     /// Patterns used to exclude sources from discovery, if any.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_patterns: Vec<String>,
@@ -267,6 +272,9 @@ pub struct VulnerabilityReportSpec {
     /// Rendered "Reasoning effort" line.
     pub reasoning_markdown: String,
     pub coverage_markdown: String,
+    /// Project roots the findings are grouped by, relative to the workspace root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<String>,
     pub findings: Vec<VulnerabilityFinding>,
 }
 

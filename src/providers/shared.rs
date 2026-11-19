@@ -64,6 +64,36 @@ pub(crate) fn is_ignored_path(project_root: &Path, canonical_path: &Path) -> boo
     false
 }
 
+/// Returns `true` when `canonical_path` lies inside a directory reads must not
+/// reach.
+///
+/// `.git`/`target`/`.tx3`/`build` are always off limits. Nested-project pruning
+/// only applies when the workspace root is itself an Aiken project: when the
+/// root is a container (no `aiken.toml` of its own), every project below it is a
+/// candidate audit target, so reads must be able to reach them and their
+/// dependencies instead of being denied at the first `aiken.toml`.
+///
+/// `canonical_path` must already be canonicalized and under `workspace_root`.
+pub(crate) fn is_ignored_for_read_scope(workspace_root: &Path, canonical_path: &Path) -> bool {
+    if !workspace_root.join("aiken.toml").is_file() {
+        return contains_excluded_dir(workspace_root, canonical_path);
+    }
+
+    is_ignored_path(workspace_root, canonical_path)
+}
+
+fn contains_excluded_dir(project_root: &Path, canonical_path: &Path) -> bool {
+    let Ok(relative) = canonical_path.strip_prefix(project_root) else {
+        return false;
+    };
+
+    relative.components().any(|component| {
+        EXCLUDED_DIR_NAMES
+            .iter()
+            .any(|excluded| component.as_os_str() == std::ffi::OsStr::new(excluded))
+    })
+}
+
 const AGENT_SYSTEM_PROMPT: &str =
     include_str!("../../templates/aiken/audit_agent_system_prompt.md");
 const INITIAL_USER_PROMPT_TEMPLATE: &str =
@@ -825,7 +855,7 @@ pub(super) fn execute_read_request(
                 if let Some(name) = line.split_whitespace().next_back() {
                     let name = name.trim();
                     let ignored = EXCLUDED_DIR_NAMES.contains(&name)
-                        || is_ignored_path(project_root, &scoped_path.join(name));
+                        || is_ignored_for_read_scope(project_root, &scoped_path.join(name));
                     if ignored {
                         continue;
                     }
@@ -863,9 +893,15 @@ fn enforce_read_scope(
     project_root: &Path,
     permission_prompt: &PermissionPromptSpec,
 ) -> Result<()> {
+    let allowed_paths = resolve_allowed_paths(project_root, permission_prompt)?;
+    // Audited source files stay readable even when they live in a nested project
+    // that workspace-level pruning would otherwise hide, e.g. `--target`
+    // pointing at a sibling project from inside another one.
+    let is_audited_source = allowed_paths.iter().any(|allowed| allowed == scoped_path);
+
     // Excluded directories are outside the audit scope under every read scope,
     // so this gate applies before the strict/workspace branch.
-    if is_ignored_path(project_root, scoped_path) {
+    if !is_audited_source && is_ignored_for_read_scope(project_root, scoped_path) {
         return Err(miette::miette!(
             "Request denied: '{}' is inside an excluded directory ({}); \
              these directories are outside the audit scope",
@@ -893,9 +929,7 @@ fn enforce_read_scope(
         ));
     }
 
-    let allowed_paths = resolve_allowed_paths(project_root, permission_prompt)?;
-
-    if allowed_paths.iter().any(|allowed| allowed == scoped_path) {
+    if is_audited_source {
         return Ok(());
     }
 
@@ -909,11 +943,14 @@ fn resolve_allowed_paths(
     project_root: &Path,
     permission_prompt: &PermissionPromptSpec,
 ) -> Result<Vec<PathBuf>> {
-    permission_prompt
+    // An allowed path that no longer resolves (e.g. a state file written in
+    // another checkout) is simply not allowed, rather than an error that would
+    // mask the actual scope decision.
+    Ok(permission_prompt
         .allowed_paths
         .iter()
-        .map(|path| resolve_scoped_path(project_root, path))
-        .collect::<Result<Vec<PathBuf>>>()
+        .filter_map(|path| resolve_scoped_path(project_root, path).ok())
+        .collect())
 }
 
 fn confirm_request_if_interactive(
@@ -1034,7 +1071,7 @@ fn collect_allowed_files(project_root: &Path, target: &Path) -> Result<Vec<PathB
             let entry = entry.into_diagnostic()?;
             let path = entry.path();
             if path.is_dir() {
-                if !is_ignored_path(project_root, &path) {
+                if !is_ignored_for_read_scope(project_root, &path) {
                     to_visit.push(path);
                 }
             } else {
@@ -1774,6 +1811,114 @@ mod tests {
         ));
         assert!(!is_ignored_path(root, &canonical(&root.join("validators"))));
         assert!(!is_ignored_path(root, root));
+    }
+
+    #[test]
+    fn read_scope_reaches_nested_projects_when_the_workspace_root_is_a_container() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("cases/001/validators")).expect("create project");
+        std::fs::write(root.join("cases/001/aiken.toml"), "").expect("write manifest");
+        std::fs::write(
+            root.join("cases/001/validators/spend.ak"),
+            "validator spend {}\n",
+        )
+        .expect("write source");
+        let prompt = workspace_prompt(root, vec!["cat"]);
+
+        let output = execute_read_request(
+            &ReadRequest::ReadFile {
+                path: "cases/001/validators/spend.ak".to_string(),
+            },
+            &root.canonicalize().expect("canonical root"),
+            &prompt,
+        )
+        .expect("a project nested in a container must be readable");
+
+        assert!(output.contains("validator spend"));
+    }
+
+    #[test]
+    fn read_scope_still_hides_nested_projects_when_the_root_is_a_project() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        std::fs::write(root.join("aiken.toml"), "").expect("write manifest");
+        std::fs::create_dir_all(root.join("lib/vendored")).expect("create vendored");
+        std::fs::write(root.join("lib/vendored/aiken.toml"), "").expect("write nested manifest");
+        std::fs::write(root.join("lib/vendored/x.ak"), "validator x {}\n")
+            .expect("write nested source");
+        let prompt = workspace_prompt(root, vec!["cat"]);
+
+        let err = execute_read_request(
+            &ReadRequest::ReadFile {
+                path: "lib/vendored/x.ak".to_string(),
+            },
+            &root.canonicalize().expect("canonical root"),
+            &prompt,
+        )
+        .expect_err("a nested project inside an audited project stays hidden");
+
+        assert!(err.to_string().contains("excluded directory"));
+    }
+
+    #[test]
+    fn read_scope_allows_an_audited_source_inside_a_nested_project() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        std::fs::write(root.join("aiken.toml"), "").expect("write manifest");
+        std::fs::create_dir_all(root.join("cases/001/validators")).expect("create project");
+        std::fs::write(root.join("cases/001/aiken.toml"), "").expect("write nested manifest");
+        std::fs::write(
+            root.join("cases/001/validators/spend.ak"),
+            "validator spend {}\n",
+        )
+        .expect("write source");
+
+        let mut prompt = workspace_prompt(root, vec!["cat"]);
+        prompt.allowed_paths = vec!["cases/001/validators/spend.ak".to_string()];
+
+        let output = execute_read_request(
+            &ReadRequest::ReadFile {
+                path: "cases/001/validators/spend.ak".to_string(),
+            },
+            &root.canonicalize().expect("canonical root"),
+            &prompt,
+        )
+        .expect("an explicit --target must stay readable");
+
+        assert!(output.contains("validator spend"));
+    }
+
+    #[test]
+    fn strict_read_scope_denies_dependency_reads_outside_the_targets() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        for case in ["001", "002"] {
+            std::fs::create_dir_all(root.join("cases").join(case).join("validators"))
+                .expect("create project");
+            std::fs::write(root.join("cases").join(case).join("aiken.toml"), "")
+                .expect("write manifest");
+            std::fs::write(
+                root.join("cases").join(case).join("validators/spend.ak"),
+                "validator spend {}\n",
+            )
+            .expect("write source");
+        }
+
+        let mut prompt = workspace_prompt(root, vec!["cat"]);
+        prompt.read_scope = "strict".to_string();
+        prompt.allowed_paths = vec!["cases/001/validators/spend.ak".to_string()];
+
+        let err = execute_read_request(
+            &ReadRequest::ReadFile {
+                path: "cases/002/validators/spend.ak".to_string(),
+            },
+            &root.canonicalize().expect("canonical root"),
+            &prompt,
+        )
+        .expect_err("strict scope must not read untargeted projects");
+
+        assert!(err.to_string().contains("not an allowed source file"));
     }
 
     #[test]

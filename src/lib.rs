@@ -1,6 +1,7 @@
 use clap::{Args as ClapArgs, ValueEnum};
 use miette::{Context, IntoDiagnostic, Result};
 use serde::Deserialize;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -16,7 +17,7 @@ use self::model::{
     ReasoningDefault, SkillIterationResult, SourceRevision, ValidatorContextMap,
     VulnerabilityFinding, VulnerabilityReportSpec, VulnerabilitySkill,
 };
-use self::providers::shared::{UserStopped, glob_match, is_ignored_path};
+use self::providers::shared::{EXCLUDED_DIR_NAMES, UserStopped, glob_match, is_ignored_path};
 use self::providers::{AnalysisProvider, build_provider};
 
 const DEFAULT_SKILLS_DIR: &str = "skills/vulnerabilities";
@@ -132,9 +133,16 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub interactive_permissions: bool,
 
-    /// Fallback main source file path (used when no .ak files are discovered).
-    #[arg(long)]
-    pub main_source: Option<String>,
+    /// Audit only this file or directory. Repeatable; paths are resolved
+    /// against the current directory. A directory containing nested Aiken
+    /// projects audits them all.
+    #[arg(long = "target", value_name = "PATH")]
+    pub targets: Vec<String>,
+
+    /// Skip the confirmation prompt when the audit spans more than one Aiken
+    /// project.
+    #[arg(long, short = 'y', default_value_t = false)]
+    pub yes: bool,
 
     /// Exclude `*.tests.ak` files from source discovery and the audit context.
     #[arg(long, default_value_t = false)]
@@ -160,10 +168,15 @@ fn resolve_log_file(log_file: &Path, ai_logs: LogLevel) -> Option<PathBuf> {
 
 pub fn run(args: Args) -> Result<()> {
     let provider = build_provider(&args)?;
-    run_analysis(args, provider.as_ref())
+    let workspace_root = std::env::current_dir()
+        .into_diagnostic()?
+        .canonicalize()
+        .into_diagnostic()
+        .context("Failed to resolve the current directory")?;
+    run_analysis(args, provider.as_ref(), &workspace_root)
 }
 
-fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
+fn run_analysis(args: Args, provider: &dyn AnalysisProvider, workspace_root: &Path) -> Result<()> {
     // A file log keeps a durable record without scrolling the terminal, so it
     // runs alongside brief terminal output rather than replacing it.
     // The default path is only opened when logging is on, so a silent run
@@ -176,39 +189,38 @@ fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
     let state_out = PathBuf::from(&args.state_out);
     let report_out = PathBuf::from(&args.report_out);
     let ast_out = PathBuf::from(&args.ast_out);
-    let project_root = std::env::current_dir().into_diagnostic()?;
     let exclude_patterns = build_exclude_patterns(args.exclude_tests);
-    let aiken_source_files = discover_source_files(&project_root, &exclude_patterns)?;
-    let source_files = if aiken_source_files.is_empty() {
-        // `--main-source` is an explicit opt-in to a single file, so it still
-        // wins when excluding tests removed everything; warn so the override is
-        // not silent.
-        if let Some(main_source) = &args.main_source {
-            if args.exclude_tests {
-                eprintln!(
-                    "⚠️  Excluding test files left no discovered sources; auditing --main-source {} instead.",
-                    main_source
-                );
-            }
-            vec![PathBuf::from(main_source)]
-        } else if args.exclude_tests {
+    let audit_targets = resolve_audit_targets(workspace_root, &args.targets, &exclude_patterns)?;
+    let project_roots = audit_targets
+        .iter()
+        .map(|target| target.root.clone())
+        .collect::<Vec<PathBuf>>();
+    let source_files = collect_audit_files(&audit_targets);
+
+    if source_files.is_empty() {
+        if args.exclude_tests {
             return Err(miette::miette!(
-                "No .ak source files left after excluding *.tests.ak; remove --exclude-tests or pass --main-source"
-            ));
-        } else {
-            return Err(miette::miette!(
-                "No .ak source files found and no --main-source specified"
+                "No .ak source files left after excluding *.tests.ak; remove --exclude-tests or point --target at other sources"
             ));
         }
-    } else {
-        aiken_source_files.clone()
-    };
+        return Err(miette::miette!(
+            "No .ak source files found under {} (searched excluding .git/target/.tx3/build); pass --target <path>, or run preflight inside an Aiken project",
+            workspace_root.display()
+        ));
+    }
+
+    // A batch of sibling projects multiplies context and model calls by the
+    // number of projects, so confirm the scope before anything is written.
+    if !confirm_audit_scope(&args, workspace_root, &audit_targets)? {
+        return Ok(());
+    }
 
     log_audit_progress(
         args.ai_logs,
         format!(
-            "Starting audit • provider={} • source files={}",
+            "Starting audit • provider={} • projects={} • source files={}",
             provider.provider_spec().name,
+            project_roots.len(),
             source_files.len()
         ),
     );
@@ -216,13 +228,13 @@ fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
     let permission_prompt = build_permission_prompt_spec(
         args.read_scope,
         args.interactive_permissions,
-        &project_root,
+        workspace_root,
         &source_files,
     );
     let skills = load_skills(&skills_dir, &args.skills_dir)?;
     let ast_context = generate_ast_and_validator_context(
-        &project_root,
-        &aiken_source_files,
+        workspace_root,
+        &source_files,
         &ast_out,
         args.no_ast_cache,
     )?;
@@ -231,7 +243,11 @@ fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
         version: "2".to_string(),
         source_files: source_files
             .iter()
-            .map(|path| path.display().to_string())
+            .map(|path| display_relative_path(workspace_root, path))
+            .collect(),
+        projects: project_roots
+            .iter()
+            .map(|path| display_relative_path(workspace_root, path))
             .collect(),
         excluded_patterns: exclude_patterns.clone(),
         provider: provider.provider_spec(),
@@ -239,7 +255,7 @@ fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
         ast: Some(ast_context.metadata.clone()),
         validator_context: ast_context.validator_context.clone(),
         iterations: vec![],
-        source_revision: detect_source_revision(&project_root),
+        source_revision: detect_source_revision(workspace_root),
         total_token_usage: Default::default(),
         total_duration_ms: 0,
     };
@@ -287,7 +303,7 @@ fn run_analysis(args: Args, provider: &dyn AnalysisProvider) -> Result<()> {
 
     let skill_loop_context = SkillLoopContext {
         source_files: &source_files,
-        project_root: &project_root,
+        project_root: workspace_root,
         permission_prompt: &permission_prompt,
         validator_context: &ast_context.validator_context,
         provider,
@@ -346,7 +362,7 @@ fn run_skill_loop(
     let source_references = context
         .source_files
         .iter()
-        .map(|path| display_path_for_prompt(context.project_root, path))
+        .map(|path| display_relative_path(context.project_root, path))
         .collect::<Vec<String>>();
 
     let total_skills = skills.len();
@@ -699,13 +715,19 @@ fn log_audit_progress(level: LogLevel, message: impl AsRef<str>) {
     }
 }
 
-fn display_path_for_prompt(project_root: &Path, path: &Path) -> String {
-    path.strip_prefix(project_root)
-        .map(|relative| relative.display().to_string())
-        .unwrap_or_else(|_| path.display().to_string())
+/// Paths shown to the model are always workspace-relative: the prompt, findings
+/// and report agree on one spelling, and nested projects stay distinguishable.
+/// The workspace root itself renders as `"."`.
+fn display_relative_path(project_root: &Path, path: &Path) -> String {
+    match path.strip_prefix(project_root) {
+        Ok(relative) if relative.as_os_str().is_empty() => ".".to_string(),
+        Ok(relative) => relative.display().to_string(),
+        Err(_) => path.display().to_string(),
+    }
 }
 
 const TEST_SOURCE_GLOB: &str = "*.tests.ak";
+const AIKEN_MANIFEST: &str = "aiken.toml";
 
 fn build_exclude_patterns(exclude_tests: bool) -> Vec<String> {
     if exclude_tests {
@@ -713,6 +735,298 @@ fn build_exclude_patterns(exclude_tests: bool) -> Vec<String> {
     } else {
         Vec::new()
     }
+}
+
+/// One Aiken project covered by this run, with the source files audited under it.
+///
+/// The root is what a normal project audit uses for pruning, strict read scope
+/// and report grouping. A file `--target` contributes a single file under the
+/// project root that contains it.
+#[derive(Debug, Clone)]
+struct AuditTarget {
+    root: PathBuf,
+    files: Vec<PathBuf>,
+}
+
+fn is_aiken_project_root(dir: &Path) -> bool {
+    dir.join(AIKEN_MANIFEST).is_file()
+}
+
+fn is_excluded_dir_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| EXCLUDED_DIR_NAMES.contains(&name))
+}
+
+fn has_ak_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ak"))
+}
+
+/// Finds Aiken projects below a directory that is not itself a project.
+///
+/// Discovery never descends into a directory that has its own `aiken.toml`, so
+/// each project is returned once and its `build/packages` dependencies are not
+/// mistaken for independent projects. Generated directories are skipped.
+fn find_nested_project_roots(container: &Path) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    let mut to_visit = vec![container.to_path_buf()];
+
+    while let Some(dir) = to_visit.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .into_diagnostic()
+            .with_context(|| format!("Failed to read directory {}", dir.display()))?;
+
+        for entry in entries {
+            let path = entry.into_diagnostic()?.path();
+
+            if !path.is_dir() || is_excluded_dir_name(&path) {
+                continue;
+            }
+
+            if is_aiken_project_root(&path) {
+                roots.push(path);
+            } else {
+                to_visit.push(path);
+            }
+        }
+    }
+
+    roots.sort();
+    Ok(roots)
+}
+
+/// Resolves `--target` against the workspace root and rejects anything outside
+/// it, so read scope and output paths keep one boundary.
+fn resolve_workspace_path(workspace_root: &Path, requested: &str) -> Result<PathBuf> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return Err(miette::miette!("--target requires a non-empty path"));
+    }
+
+    let joined = if Path::new(requested).is_absolute() {
+        PathBuf::from(requested)
+    } else {
+        workspace_root.join(requested)
+    };
+
+    let canonical = joined
+        .canonicalize()
+        .into_diagnostic()
+        .with_context(|| format!("--target path does not exist or is inaccessible: {requested}"))?;
+
+    if !canonical.starts_with(workspace_root) {
+        return Err(miette::miette!(
+            "--target path must be inside the workspace root {}: {}",
+            workspace_root.display(),
+            requested
+        ));
+    }
+
+    Ok(canonical)
+}
+
+fn nearest_project_root(workspace_root: &Path, file: &Path) -> PathBuf {
+    let mut current = file.parent();
+
+    while let Some(dir) = current {
+        if is_aiken_project_root(dir) {
+            return dir.to_path_buf();
+        }
+        if dir == workspace_root {
+            break;
+        }
+        current = dir.parent();
+    }
+
+    workspace_root.to_path_buf()
+}
+
+fn merge_audit_target(targets: &mut Vec<AuditTarget>, root: PathBuf, files: Vec<PathBuf>) {
+    let mut files = files;
+    files.sort();
+    files.dedup();
+
+    if let Some(existing) = targets.iter_mut().find(|target| target.root == root) {
+        existing.files.extend(files);
+        existing.files.sort();
+        existing.files.dedup();
+        return;
+    }
+
+    targets.push(AuditTarget { root, files });
+}
+
+/// Decides which projects and files this run audits.
+///
+/// Without `--target`, the workspace root is the project when it has an
+/// `aiken.toml`; otherwise it is treated as a container and every project below
+/// it is audited. With `--target`, only the named files and directories are
+/// audited -- reads can still reach the rest of the workspace, so the model can
+/// follow dependencies the targets import.
+fn resolve_audit_targets(
+    workspace_root: &Path,
+    requested_targets: &[String],
+    exclude_patterns: &[String],
+) -> Result<Vec<AuditTarget>> {
+    let mut targets = Vec::new();
+
+    if requested_targets.is_empty() {
+        let roots = if is_aiken_project_root(workspace_root) {
+            vec![workspace_root.to_path_buf()]
+        } else {
+            let nested = find_nested_project_roots(workspace_root)?;
+            if nested.is_empty() {
+                return Err(miette::miette!(
+                    "No Aiken project found: {} has no aiken.toml and no nested project was discovered (searched excluding .git/target/.tx3/build); pass --target <path>, or run preflight inside an Aiken project",
+                    workspace_root.display()
+                ));
+            }
+            nested
+        };
+
+        for root in roots {
+            let files = discover_source_files(&root, exclude_patterns)?;
+            merge_audit_target(&mut targets, root, files);
+        }
+
+        targets.sort_by(|a, b| a.root.cmp(&b.root));
+        return Ok(targets);
+    }
+
+    for requested in requested_targets {
+        let path = resolve_workspace_path(workspace_root, requested)?;
+
+        if path.is_file() {
+            if !has_ak_extension(&path) {
+                return Err(miette::miette!(
+                    "--target must point at a .ak file or a directory: {}",
+                    path.display()
+                ));
+            }
+            // A file target audits only that file, even though its project root
+            // is kept for pruning, read scope and report grouping.
+            let root = nearest_project_root(workspace_root, &path);
+            merge_audit_target(&mut targets, root, vec![path]);
+            continue;
+        }
+
+        let roots = if is_aiken_project_root(&path) {
+            vec![path]
+        } else {
+            let nested = find_nested_project_roots(&path)?;
+            if nested.is_empty() {
+                // A plain directory of `.ak` files with no manifest is still a
+                // legitimate audit target.
+                vec![path]
+            } else {
+                nested
+            }
+        };
+
+        for root in roots {
+            let files = discover_source_files(&root, exclude_patterns)?;
+            merge_audit_target(&mut targets, root, files);
+        }
+    }
+
+    targets.sort_by(|a, b| a.root.cmp(&b.root));
+    Ok(targets)
+}
+
+fn collect_audit_files(targets: &[AuditTarget]) -> Vec<PathBuf> {
+    let mut files = targets
+        .iter()
+        .flat_map(|target| target.files.iter().cloned())
+        .collect::<Vec<PathBuf>>();
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// The analysis provider families that spend money per model call.
+fn provider_is_paid(provider: &str) -> bool {
+    matches!(
+        provider.to_ascii_lowercase().as_str(),
+        "openai" | "anthropic" | "ollama"
+    )
+}
+
+/// Confirms an audit that spans several projects before any output is written.
+///
+/// A batch multiplies the context and the model calls by the number of projects,
+/// so an unanswered question must not silently spend the budget. Interactive
+/// runs ask; non-interactive runs refuse and name the flags that resolve it.
+fn confirm_audit_scope(
+    args: &Args,
+    workspace_root: &Path,
+    targets: &[AuditTarget],
+) -> Result<bool> {
+    if targets.len() <= 1 {
+        return Ok(true);
+    }
+
+    let source_count = targets
+        .iter()
+        .map(|target| target.files.len())
+        .sum::<usize>();
+    let project_list = targets
+        .iter()
+        .map(|target| format!("  {}", display_relative_path(workspace_root, &target.root)))
+        .collect::<Vec<String>>()
+        .join("\n");
+
+    if args.yes {
+        log_audit_progress(
+            args.ai_logs,
+            format!(
+                "Auditing {} Aiken projects ({} source files) as confirmed by --yes",
+                targets.len(),
+                source_count
+            ),
+        );
+        return Ok(true);
+    }
+
+    let mut banner = format!(
+        "preflight: found {} Aiken projects under {}:\n{}\n({} source files in total)",
+        targets.len(),
+        workspace_root.display(),
+        project_list,
+        source_count
+    );
+
+    if provider_is_paid(&args.provider) {
+        banner.push_str(&format!(
+            "\nAuditing all of them in one merged report costs roughly {}x the context and model calls of a single project.",
+            targets.len()
+        ));
+    }
+
+    if !io::stdin().is_terminal() {
+        return Err(miette::miette!(
+            "{banner}\nRefusing to audit {} projects without confirmation; pass --yes, or narrow the scope with --target <path>",
+            targets.len()
+        ));
+    }
+
+    eprintln!("{banner}");
+    eprint!("Continue? [y/N]: ");
+    io::stderr().flush().into_diagnostic()?;
+
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer).into_diagnostic()?;
+
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        return Ok(true);
+    }
+
+    eprintln!(
+        "Audit cancelled. Narrow the scope with --target <path>, e.g. --target {}.",
+        display_relative_path(workspace_root, &targets[0].root)
+    );
+    Ok(false)
 }
 
 fn discover_source_files(project_root: &Path, exclude_patterns: &[String]) -> Result<Vec<PathBuf>> {
@@ -738,11 +1052,7 @@ fn discover_source_files(project_root: &Path, exclude_patterns: &[String]) -> Re
                 continue;
             }
 
-            let is_source_file = path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("ak"))
-                .unwrap_or(false);
+            let is_source_file = has_ak_extension(&path);
 
             if is_source_file && !is_excluded_source(project_root, &path, exclude_patterns) {
                 files.push(path);
@@ -829,14 +1139,13 @@ fn build_permission_prompt_spec(
     project_root: &Path,
     source_files: &[PathBuf],
 ) -> PermissionPromptSpec {
-    let allowed_paths = if matches!(read_scope, ReadScopeArg::Strict) {
-        source_files
-            .iter()
-            .map(|path| display_path_for_prompt(project_root, path))
-            .collect::<Vec<String>>()
-    } else {
-        vec![]
-    };
+    // The audited sources are always listed: `strict` uses the list as its
+    // allow-list, and `workspace` uses it to keep audited files readable even
+    // when they sit in a nested project the workspace-level pruning hides.
+    let allowed_paths = source_files
+        .iter()
+        .map(|path| display_relative_path(project_root, path))
+        .collect::<Vec<String>>();
 
     let mut scope_rules = vec![
         "Only execute commands within the current project root.".to_string(),
@@ -845,11 +1154,11 @@ fn build_permission_prompt_spec(
 
     if matches!(read_scope, ReadScopeArg::Strict) {
         scope_rules.push(
-            "Read scope is strict: only known source files are allowed for reads/searches; directory listing and file discovery requests are denied.".to_string(),
+            "Read scope is strict: only the audited source files are allowed for reads/searches; directory listing and file discovery requests are denied, and dependencies outside the audited sources cannot be opened.".to_string(),
         );
     } else {
         scope_rules.push(
-            "Read scope is workspace: any path under project root can be read/searched, except generated/excluded directories (.git, target, .tx3, build) and nested projects, which are never accessible."
+            "Read scope is workspace: any path under project root can be read/searched, except generated/excluded directories (.git, target, .tx3, build) and, when the root is itself an Aiken project, nested projects."
                 .to_string(),
         );
     }
@@ -961,6 +1270,7 @@ fn build_report(
         provider_markdown: render_provider_markdown(&state.provider),
         reasoning_markdown: render_reasoning_markdown(&state.provider),
         coverage_markdown: render_coverage_markdown(state, skills, findings.len(), aborted),
+        projects: state.projects.clone(),
         findings,
     }
 }
@@ -1082,6 +1392,45 @@ fn render_coverage_markdown(
             "\n- Stale iterations ignored (skill no longer loaded): {}",
             ignored
         ));
+    }
+
+    if state.projects.len() > 1 {
+        coverage.push_str(&format!(
+            "\n- Aiken projects audited: {}",
+            state.projects.len()
+        ));
+
+        let findings = state
+            .iterations
+            .iter()
+            .flat_map(|iteration| iteration.findings.iter())
+            .collect::<Vec<&VulnerabilityFinding>>();
+
+        let project_lines = state
+            .projects
+            .iter()
+            .enumerate()
+            .map(|(index, project)| {
+                let files = state
+                    .source_files
+                    .iter()
+                    .filter(|file| path_is_under_project(project, file))
+                    .count();
+                let project_findings = findings
+                    .iter()
+                    .filter(|finding| {
+                        project_index_for_finding(finding, &state.projects) == Some(index)
+                    })
+                    .count();
+                format!(
+                    "- `{}` — {} source file(s), {} finding(s)",
+                    project, files, project_findings
+                )
+            })
+            .collect::<Vec<String>>();
+
+        coverage.push_str("\n\n### Projects\n\n");
+        coverage.push_str(&project_lines.join("\n"));
     }
 
     if !skill_lines.is_empty() {
@@ -1354,7 +1703,7 @@ fn write_text_file(path: &Path, content: &str) -> Result<()> {
 
 fn render_report_markdown(report: &VulnerabilityReportSpec) -> String {
     let template = include_str!("../templates/aiken/report.md");
-    let findings_markdown = render_findings_markdown(&report.findings);
+    let findings_markdown = render_findings_markdown(&report.findings, &report.projects);
 
     template
         .replace("{{ generated_at }}", &report.generated_at)
@@ -1365,34 +1714,107 @@ fn render_report_markdown(report: &VulnerabilityReportSpec) -> String {
         .replace("{{ findings_markdown }}", &findings_markdown)
 }
 
-fn render_findings_markdown(findings: &[VulnerabilityFinding]) -> String {
+/// Renders findings flat for a single project, and grouped under one heading per
+/// project when the audit covered several.
+fn render_findings_markdown(findings: &[VulnerabilityFinding], projects: &[String]) -> String {
+    if projects.len() > 1 {
+        return render_findings_by_project(findings, projects);
+    }
+
     if findings.is_empty() {
         return "- *(none)*".to_string();
     }
 
     findings
         .iter()
-        .map(|finding| {
-            let mut markdown = format!(
-                "- **{}** (`{}`)\n  - Summary: {}\n  - Recommendation: {}",
-                finding.title, finding.severity, finding.summary, finding.recommendation
-            );
-
-            let location = match (&finding.file, finding.line) {
-                (Some(file), Some(line)) => Some(format!("{}:{}", file, line)),
-                (Some(file), None) => Some(file.clone()),
-                (None, Some(line)) => Some(format!("line {}", line)),
-                (None, None) => None,
-            };
-
-            if let Some(location) = location {
-                markdown.push_str(&format!("\n  - Location: {}", location));
-            }
-
-            markdown
-        })
+        .map(render_one_finding_markdown)
         .collect::<Vec<String>>()
         .join("\n")
+}
+
+fn render_findings_by_project(findings: &[VulnerabilityFinding], projects: &[String]) -> String {
+    let mut buckets = vec![Vec::new(); projects.len()];
+    let mut unassigned = Vec::new();
+
+    for finding in findings {
+        match project_index_for_finding(finding, projects) {
+            Some(index) => buckets[index].push(finding),
+            None => unassigned.push(finding),
+        }
+    }
+
+    let mut sections = Vec::new();
+    for (project, bucket) in projects.iter().zip(buckets.iter()) {
+        let body = if bucket.is_empty() {
+            "- *(none)*".to_string()
+        } else {
+            bucket
+                .iter()
+                .map(|finding| render_one_finding_markdown(finding))
+                .collect::<Vec<String>>()
+                .join("\n")
+        };
+        sections.push(format!("### {}\n\n{}", project, body));
+    }
+
+    if !unassigned.is_empty() {
+        let body = unassigned
+            .iter()
+            .map(|finding| render_one_finding_markdown(finding))
+            .collect::<Vec<String>>()
+            .join("\n");
+        sections.push(format!("### (outside audited projects)\n\n{}", body));
+    }
+
+    sections.join("\n\n")
+}
+
+/// Whether a workspace-relative path belongs to a workspace-relative project
+/// root. `"."` is the workspace root itself.
+fn path_is_under_project(project: &str, path: &str) -> bool {
+    let project = project.trim_end_matches('/');
+    if project == "." || project.is_empty() {
+        return true;
+    }
+
+    path == project || path.starts_with(&format!("{project}/"))
+}
+
+/// The most specific project a finding belongs to, so nested projects report
+/// under their own heading instead of the container's.
+fn project_index_for_finding(finding: &VulnerabilityFinding, projects: &[String]) -> Option<usize> {
+    let file = finding.file.as_deref()?.trim();
+    let file = file.strip_prefix("./").unwrap_or(file);
+    if file.is_empty() {
+        return None;
+    }
+
+    projects
+        .iter()
+        .enumerate()
+        .filter(|(_, project)| path_is_under_project(project, file))
+        .max_by_key(|(_, project)| project.trim_end_matches('/').len())
+        .map(|(index, _)| index)
+}
+
+fn render_one_finding_markdown(finding: &VulnerabilityFinding) -> String {
+    let mut markdown = format!(
+        "- **{}** (`{}`)\n  - Summary: {}\n  - Recommendation: {}",
+        finding.title, finding.severity, finding.summary, finding.recommendation
+    );
+
+    let location = match (&finding.file, finding.line) {
+        (Some(file), Some(line)) => Some(format!("{}:{}", file, line)),
+        (Some(file), None) => Some(file.clone()),
+        (None, Some(line)) => Some(format!("line {}", line)),
+        (None, None) => None,
+    };
+
+    if let Some(location) = location {
+        markdown.push_str(&format!("\n  - Location: {}", location));
+    }
+
+    markdown
 }
 
 #[cfg(test)]
@@ -1553,6 +1975,388 @@ body
         assert_eq!(build_exclude_patterns(true), vec!["*.tests.ak".to_string()]);
     }
 
+    fn write_ak(path: &Path) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+        fs::write(path, "validator v {}\n").expect("write ak");
+    }
+
+    fn canonical_temp_root(temp: &tempfile::TempDir) -> PathBuf {
+        temp.path().canonicalize().expect("canonical temp dir")
+    }
+
+    #[test]
+    fn resolve_audit_targets_audits_every_nested_project_from_a_container_root() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = canonical_temp_root(&temp);
+
+        for case in ["001", "002"] {
+            std::fs::create_dir_all(root.join(case)).expect("create case");
+            fs::write(root.join(case).join("aiken.toml"), "").expect("write manifest");
+            write_ak(&root.join(case).join("validators/spend.ak"));
+        }
+
+        // A project's vendored dependencies are generated output, not audited
+        // projects of their own.
+        std::fs::write(root.join("001/build/packages/dep/aiken.toml"), "").ok();
+        write_ak(&root.join("001/build/packages/dep/lib/stdlib.ak"));
+
+        let targets = resolve_audit_targets(&root, &[], &[]).expect("resolve");
+        let files = collect_audit_files(&targets);
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(files.len(), 2);
+        assert!(
+            files
+                .iter()
+                .all(|file| !file.to_string_lossy().contains("build"))
+        );
+    }
+
+    #[test]
+    fn resolve_audit_targets_errors_when_the_container_has_no_projects() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = canonical_temp_root(&temp);
+        fs::create_dir_all(root.join("docs")).expect("create docs");
+
+        let error = resolve_audit_targets(&root, &[], &[]).expect_err("should fail");
+
+        assert!(error.to_string().contains("No Aiken project found"));
+        assert!(error.to_string().contains("--target"));
+    }
+
+    #[test]
+    fn resolve_audit_targets_keeps_nested_projects_out_of_a_single_project_audit() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = canonical_temp_root(&temp);
+
+        fs::write(root.join("aiken.toml"), "").expect("write manifest");
+        write_ak(&root.join("validators/spend.ak"));
+        std::fs::create_dir_all(root.join("lib/vendored")).expect("create nested project");
+        fs::write(root.join("lib/vendored/aiken.toml"), "").expect("write nested manifest");
+        write_ak(&root.join("lib/vendored/lib/other.ak"));
+
+        let targets = resolve_audit_targets(&root, &[], &[]).expect("resolve");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].root, root);
+        assert_eq!(
+            collect_audit_files(&targets),
+            vec![root.join("validators/spend.ak")]
+        );
+    }
+
+    #[test]
+    fn resolve_audit_targets_file_target_audits_only_that_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = canonical_temp_root(&temp);
+
+        fs::write(root.join("aiken.toml"), "").expect("write manifest");
+        write_ak(&root.join("validators/spend.ak"));
+        write_ak(&root.join("validators/mint.ak"));
+
+        let targets = resolve_audit_targets(&root, &["validators/mint.ak".to_string()], &[])
+            .expect("resolve");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].root, root);
+        assert_eq!(
+            collect_audit_files(&targets),
+            vec![root.join("validators/mint.ak")]
+        );
+    }
+
+    #[test]
+    fn resolve_audit_targets_unions_repeated_targets_without_duplicates() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = canonical_temp_root(&temp);
+
+        for case in ["001", "002"] {
+            std::fs::create_dir_all(root.join(case)).expect("create case");
+            fs::write(root.join(case).join("aiken.toml"), "").expect("write manifest");
+            write_ak(&root.join(case).join("validators/spend.ak"));
+        }
+
+        let targets = resolve_audit_targets(
+            &root,
+            &[
+                "001".to_string(),
+                "002".to_string(),
+                "001/validators/spend.ak".to_string(),
+            ],
+            &[],
+        )
+        .expect("resolve");
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(collect_audit_files(&targets).len(), 2);
+    }
+
+    #[test]
+    fn resolve_audit_targets_dir_target_splits_nested_projects() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = canonical_temp_root(&temp);
+
+        for case in ["001", "002"] {
+            std::fs::create_dir_all(root.join("cases").join(case)).expect("create case");
+            fs::write(root.join("cases").join(case).join("aiken.toml"), "")
+                .expect("write manifest");
+            write_ak(&root.join("cases").join(case).join("validators/spend.ak"));
+        }
+
+        let targets = resolve_audit_targets(&root, &["cases".to_string()], &[]).expect("resolve");
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(collect_audit_files(&targets).len(), 2);
+    }
+
+    #[test]
+    fn resolve_audit_targets_plain_dir_without_manifest_is_a_root() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = canonical_temp_root(&temp);
+        write_ak(&root.join("loose/spend.ak"));
+
+        let targets = resolve_audit_targets(&root, &["loose".to_string()], &[]).expect("resolve");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].root, root.join("loose"));
+        assert_eq!(
+            collect_audit_files(&targets),
+            vec![root.join("loose/spend.ak")]
+        );
+    }
+
+    #[test]
+    fn resolve_audit_targets_rejects_paths_outside_the_workspace() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = canonical_temp_root(&temp);
+        let outside = tempfile::tempdir().expect("outside dir");
+        write_ak(&outside.path().join("spend.ak"));
+
+        let error = resolve_audit_targets(
+            &root,
+            &[outside.path().join("spend.ak").display().to_string()],
+            &[],
+        )
+        .expect_err("should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("must be inside the workspace root")
+        );
+    }
+
+    #[test]
+    fn resolve_audit_targets_rejects_non_ak_file_targets() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = canonical_temp_root(&temp);
+        fs::write(root.join("README.md"), "").expect("write readme");
+
+        let error =
+            resolve_audit_targets(&root, &["README.md".to_string()], &[]).expect_err("should fail");
+
+        assert!(error.to_string().contains("must point at a .ak file"));
+    }
+
+    #[test]
+    fn resolve_audit_targets_rejects_missing_targets() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = canonical_temp_root(&temp);
+
+        let error =
+            resolve_audit_targets(&root, &["nope".to_string()], &[]).expect_err("should fail");
+
+        assert!(error.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn resolve_audit_targets_applies_exclude_tests_to_targets() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = canonical_temp_root(&temp);
+        fs::write(root.join("aiken.toml"), "").expect("write manifest");
+        write_ak(&root.join("validators/spend.ak"));
+        write_ak(&root.join("validators/spend.tests.ak"));
+
+        let targets =
+            resolve_audit_targets(&root, &[], &build_exclude_patterns(true)).expect("resolve");
+
+        assert_eq!(
+            collect_audit_files(&targets),
+            vec![root.join("validators/spend.ak")]
+        );
+    }
+
+    fn finding_in(file: &str, title: &str) -> VulnerabilityFinding {
+        VulnerabilityFinding {
+            title: title.to_string(),
+            severity: "high".to_string(),
+            summary: "summary".to_string(),
+            evidence: Vec::new(),
+            recommendation: "recommendation".to_string(),
+            file: Some(file.to_string()),
+            line: Some(1),
+        }
+    }
+
+    #[test]
+    fn render_findings_markdown_groups_findings_by_project() {
+        let projects = vec!["cases/001".to_string(), "cases/002".to_string()];
+        let findings = vec![
+            finding_in("cases/002/validators/spend.ak", "second project"),
+            finding_in("elsewhere/other.ak", "outside"),
+        ];
+
+        let markdown = render_findings_markdown(&findings, &projects);
+
+        assert!(markdown.contains("### cases/001"));
+        assert!(markdown.contains("### cases/002"));
+        assert!(markdown.contains("### (outside audited projects)"));
+        assert!(markdown.contains("second project"));
+        // A project without findings still gets a heading and an explicit empty.
+        let first = markdown
+            .split("### cases/002")
+            .next()
+            .expect("first section");
+        assert!(first.contains("- *(none)*"));
+    }
+
+    #[test]
+    fn project_index_for_finding_prefers_the_most_specific_root() {
+        let projects = vec![".".to_string(), "cases/001".to_string()];
+
+        let index = project_index_for_finding(
+            &finding_in("./cases/001/validators/spend.ak", "t"),
+            &projects,
+        );
+
+        assert_eq!(index, Some(1));
+    }
+
+    #[test]
+    fn render_findings_markdown_stays_flat_for_a_single_project() {
+        let findings = vec![finding_in("validators/spend.ak", "only")];
+
+        let markdown = render_findings_markdown(&findings, &[".".to_string()]);
+
+        assert!(!markdown.contains("###"));
+        assert!(markdown.contains("only"));
+    }
+
+    #[test]
+    fn coverage_lists_each_project_with_file_and_finding_counts() {
+        let mut state = empty_state();
+        state.projects = vec!["cases/001".to_string(), "cases/002".to_string()];
+        state.source_files = vec![
+            "cases/001/validators/spend.ak".to_string(),
+            "cases/002/validators/spend.ak".to_string(),
+        ];
+        state.iterations = vec![SkillIterationResult {
+            skill_id: "s1".to_string(),
+            status: "completed".to_string(),
+            findings: vec![finding_in("cases/002/validators/spend.ak", "t")],
+            next_prompt: None,
+            skill_fingerprint: None,
+            provider: None,
+            duration_ms: None,
+            analysis_summary: None,
+            error: None,
+            token_usage: Default::default(),
+        }];
+
+        let coverage = render_coverage_markdown(&state, &[], 1, false);
+
+        assert!(coverage.contains("### Projects"));
+        assert!(coverage.contains("- `cases/001` — 1 source file(s), 0 finding(s)"));
+        assert!(coverage.contains("- `cases/002` — 1 source file(s), 1 finding(s)"));
+    }
+
+    fn test_args(root: &Path) -> Args {
+        let skills = root.join("skills");
+        std::fs::create_dir_all(&skills).expect("create skills");
+        fs::write(
+            skills.join("skill.md"),
+            "---\nid: test-001\nname: Test\nseverity: low\ndescription: d\nprompt_fragment: p\n---\nbody\n",
+        )
+        .expect("write skill");
+
+        Args {
+            state_out: root.join("out/state.json").display().to_string(),
+            resume: false,
+            resume_strict: false,
+            report_out: root.join("out/vulnerabilities.md").display().to_string(),
+            skills_dir: skills.display().to_string(),
+            provider: "scaffold".to_string(),
+            endpoint: None,
+            model: None,
+            api_key_env: None,
+            ai_logs: LogLevel::Off,
+            log_file: PathBuf::new(),
+            max_agent_steps: 1,
+            reasoning_effort: None,
+            ast_out: root.join("out/aiken-ast.json").display().to_string(),
+            no_ast_cache: true,
+            read_scope: ReadScopeArg::Workspace,
+            interactive_permissions: false,
+            targets: Vec::new(),
+            yes: true,
+            exclude_tests: false,
+        }
+    }
+
+    #[test]
+    fn target_audit_builds_the_ast_from_the_target_file() {
+        // Regression: the old --main-source fallback filled `source_files` but
+        // the AST was still built from the empty discovery result, so a
+        // target-only run failed with "No .ak source file could be parsed".
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = canonical_temp_root(&temp);
+        write_ak(&root.join("loose/spend.ak"));
+
+        let mut args = test_args(&root);
+        args.targets = vec!["loose/spend.ak".to_string()];
+
+        let provider = crate::providers::build_provider(&args).expect("provider");
+        run_analysis(args, provider.as_ref(), &root).expect("audit should succeed");
+
+        let state: AnalysisStateJson = serde_json::from_str(
+            &fs::read_to_string(root.join("out/state.json")).expect("state file"),
+        )
+        .expect("state json");
+
+        assert_eq!(state.source_files, vec!["loose/spend.ak"]);
+        assert_eq!(state.projects, vec!["."]);
+        assert_eq!(state.iterations.len(), 1);
+    }
+
+    #[test]
+    fn target_audit_reports_every_project_of_a_container() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = canonical_temp_root(&temp);
+        for case in ["001", "002"] {
+            fs::create_dir_all(root.join(case)).expect("create case");
+            fs::write(root.join(case).join("aiken.toml"), "").expect("write manifest");
+            write_ak(&root.join(case).join("validators/spend.ak"));
+        }
+
+        let args = test_args(&root);
+        let provider = crate::providers::build_provider(&args).expect("provider");
+        run_analysis(args, provider.as_ref(), &root).expect("audit should succeed");
+
+        let state: AnalysisStateJson = serde_json::from_str(
+            &fs::read_to_string(root.join("out/state.json")).expect("state file"),
+        )
+        .expect("state json");
+        let report = fs::read_to_string(root.join("out/vulnerabilities.md")).expect("report");
+
+        assert_eq!(state.projects, vec!["001", "002"]);
+        assert_eq!(
+            state.source_files,
+            vec!["001/validators/spend.ak", "002/validators/spend.ak"]
+        );
+        assert!(report.contains("### 001"));
+        assert!(report.contains("### 002"));
+    }
+
     #[test]
     fn render_findings_markdown_includes_location_when_available() {
         let findings = vec![VulnerabilityFinding {
@@ -1565,7 +2369,7 @@ body
             line: Some(42),
         }];
 
-        let markdown = render_findings_markdown(&findings);
+        let markdown = render_findings_markdown(&findings, &[]);
 
         assert!(markdown.contains("Location: validators/spend.ak:42"));
     }
@@ -1776,6 +2580,7 @@ body
             provider_markdown: "Provider / model: openai-compatible (glm)".to_string(),
             reasoning_markdown: "Reasoning effort: high".to_string(),
             coverage_markdown: "coverage".to_string(),
+            projects: Vec::new(),
             findings: Vec::new(),
         };
 
@@ -1800,6 +2605,7 @@ body
         AnalysisStateJson {
             version: "2".to_string(),
             source_files: Vec::new(),
+            projects: Vec::new(),
             excluded_patterns: Vec::new(),
             provider: crate::model::ProviderSpec {
                 name: "test".to_string(),

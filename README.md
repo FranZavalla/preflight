@@ -6,7 +6,7 @@
 
 ## How it works
 
-1. **Source discovery** — recursively scans the working directory for `.ak` files (skipping `target/`, `build/`, `.git/`, `.tx3/`, and nested projects with their own `aiken.toml`). Pass `--exclude-tests` to keep `*.tests.ak` files out of the audit context.
+1. **Source discovery** — recursively scans the working directory for `.ak` files (skipping `target/`, `build/`, `.git/`, `.tx3/`, and nested projects with their own `aiken.toml`). If the working directory is not itself an Aiken project, every project nested below it is audited instead. Pass `--exclude-tests` to keep `*.tests.ak` files out of the audit context, or `--target` to audit only a specific file or directory.
 2. **AST generation** — parses each source file with `aiken-lang`, builds a per-validator context (handlers, parameters, source spans), and caches the snapshot to `.tx3/audit/aiken-ast.json`.
 3. **Skill loop** — for each vulnerability skill (markdown files with YAML frontmatter), invokes the configured provider with the skill prompt and AST context. The provider returns findings (or asks for additional file reads via a tool-call loop).
 4. **Persistence** — after every skill iteration, the analysis state is written to `.tx3/audit/state.json`. Pass `--resume` to skip completed skills and retry failed or missing ones after an interruption.
@@ -33,6 +33,8 @@ Run `preflight` from the root of an Aiken project:
 ```bash
 preflight --provider openai
 ```
+
+It also works from a folder that holds several Aiken projects: when there is no `aiken.toml` at the working directory, every project nested below it is discovered and audited into one merged report, sectioned per project. That scope is confirmed interactively first; non-interactive runs refuse unless `--yes` is passed.
 
 By default the tool writes:
 
@@ -123,12 +125,31 @@ preflight --provider openai --resume
 
 Resume reuses completed iterations whose skill content is unchanged, re-runs skills that changed or failed, and refuses to resume if the source files changed. Use `--resume-strict` to re-run completed skills when the provider, model, or endpoint changed. Results are reused only within the same preflight build and prompt-template set; upgrading preflight re-runs completed skills. Run without `--resume` for a fresh audit.
 
+### Targets
+
+`--target <path>` audits only the given file or directory instead of the whole workspace. It is repeatable and accepts `.ak` files or directories:
+
+```bash
+# One project out of a multi-project repository
+preflight --target cardano-audit-skills/test-cases/008-missing-address-validation
+
+# Several, in a single merged report
+preflight --target cases/001 --target cases/002
+
+# A single validator, while the model can still follow its imports
+preflight --target cases/001/validators/spend.ak
+```
+
+Only the targets are audited, but reads are not limited to them: under the default `--read-scope workspace` the model can open other files in the workspace, such as imported modules and `lib/` helpers. `--read-scope strict` is the opposite — it restricts reads to the audited files themselves.
+
+When a `--target` directory contains Aiken projects, each of them is audited. Audits spanning more than one project ask for confirmation; `--yes` skips the prompt for scripts and CI.
+
 ### Permission scoping
 
 When the AI provider asks to read additional files, requests are gated:
 
-- `--read-scope workspace` (default) — any path under the project root may be read. Excluded directories (`.git/`, `target/`, `.tx3/`, `build/`, and nested projects) are always pruned and unreachable, for every scope.
-- `--read-scope strict` — only the source files discovered up front are readable.
+- `--read-scope workspace` (default) — any path under the project root may be read. `.git/`, `target/`, `.tx3/`, and `build/` are always pruned and unreachable, as are nested projects when the root is itself an Aiken project. When the root is a container of projects, those projects are readable because they are audit targets.
+- `--read-scope strict` — only the audited source files are readable; dependencies outside them cannot be opened.
 - `--interactive-permissions` — prompt the user before each AI-requested read.
 
 `--exclude-tests` affects source discovery and the audit context. With `--read-scope strict`, excluded test files are also unreadable.
@@ -191,7 +212,8 @@ preflight [OPTIONS]
 
   --read-scope <SCOPE>            workspace | strict                         [default: workspace]
   --interactive-permissions       Confirm every AI-requested read.
-  --main-source <PATH>            Fallback source file when no .ak files are discovered.
+  --target <PATH>                 Audit only this file or directory. Repeatable, workspace-relative.
+  --yes                           Skip the multi-project confirmation prompt.
   --exclude-tests                 Exclude *.tests.ak files from source discovery.
 ```
 
